@@ -1,0 +1,711 @@
+---
+title: "SpatioMark vs PACE — Breast Cancer (10x Xenium)"
+author: "Elijah Willie"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: show
+    code-tools: true
+    fig-width: 8
+    fig-height: 5
+    df-print: paged
+    embed-resources: true
+execute:
+  echo: true
+  warning: false
+  message: false
+editor:
+  markdown:
+    wrap: 72
+---
+
+**SpatioMark** (Iyengar et al., *Bioinformatics* 2025; the `Statial` package,
+`calcStateChanges`) is the **single-gene pairwise** proximity→state baseline that
+PACE generalises. For a *from* (focal) cell type and a *to* (neighbour) cell
+type, it regresses each marker's expression in the focal cells on the **distance
+to the nearest** neighbour-type cell, per image. It also provides a lateral
+marker-spillover correction (`calcContamination` + `contamination = TRUE`),
+which makes it a useful second point of contact for PACE's contamination claim.
+
+**BC is a single physical section** → one `imageID` (we do **not** split by the
+`slide`/CV-fold column). We run SpatioMark on the same 8-CT BC data, raw and
+contamination-corrected, then match its `(from, to)` state-change genes to PACE's
+MCSD drivers for the canonical focal←Tumour pairs.
+
+> Requires `Statial`: `BiocManager::install("Statial")`. `calcStateChanges` over
+> all pairs on ~126k cells is heavy; the runs are cached.
+
+# Setup
+
+```{r setup}
+rm(list = ls())
+gc()
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(patchwork)
+  library(ggrepel)
+  library(Matrix)
+  library(SpatialExperiment)
+  library(SingleCellExperiment)
+  library(SummarizedExperiment)
+})
+options(dplyr.summarise.inform = FALSE)
+
+if (!requireNamespace("Statial", quietly = TRUE)) {
+  stop("Statial not installed. Run: BiocManager::install('Statial')")
+}
+library(Statial)
+
+setwd("../../pace_mv")                                  # mirrors analysis_bc.qmd
+
+spe_path  <- "../../data/spe_10x_nuclei_withMetrics.rds"
+pace_path <- "../../data/breast_cancer/mvpql_percell_hc.rds"
+# Resolve to an ABSOLUTE path so readRDS works regardless of the chunk's working
+# dir (knitr runs each chunk from the document dir, not the setup chunk's setwd).
+for (cand in c(pace_path, file.path("..", pace_path), file.path("pace_mv", pace_path))) {
+  if (file.exists(cand)) { pace_path <- normalizePath(cand); break }
+}
+out_dir   <- "figures/spatiomark"
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+min_detection <- 0.05
+cell_types <- c("T_Cell", "Stromal", "Macrophage", "Tumour", "Endothelial",
+                "B_Cell", "Myoepithelial", "Dendritic_Cell")
+```
+
+# Load SPE, collapse to 8 cell types, drop Mast
+
+```{r load-spe}
+spe <- readRDS(spe_path)
+
+celltype_map <- c(
+  `CRABP2+ Malignant`  = "Tumour",
+  `ECM1+ Malignant`    = "Tumour",
+  `SCGB2A2+ Malignant` = "Tumour",
+  `ACTA2+ Myoepi`      = "Myoepithelial",
+  `KRT15+ Myoepi`      = "Myoepithelial",
+  `Firoblast`          = "Stromal",
+  `VWF+ Endothelial`   = "Endothelial",
+  `STAB2+ Endothelial` = "Endothelial",
+  `CD4 T`              = "T_Cell",
+  `CD8 T`              = "T_Cell",
+  `B Cells`            = "B_Cell",
+  `Plasma`             = "B_Cell",
+  `Macrophage`         = "Macrophage",
+  `CD163+ Macrophage`  = "Macrophage",
+  `IRF7+ DC`           = "Dendritic_Cell",
+  `LAMP3+ DC`          = "Dendritic_Cell",
+  `Mast cells`         = "Mast"
+)
+
+sc_label  <- as.character(colData(spe)$scClassify)
+celltype  <- celltype_map[sc_label]
+keep_cell <- !is.na(celltype) & celltype != "Mast"
+spe       <- spe[, keep_cell]
+celltype  <- celltype[keep_cell]
+print(table(celltype))
+```
+
+# Build the SingleCellExperiment for SpatioMark
+
+SpatioMark reads an expression assay (`"intensities"`), a `cellType` column,
+`x`/`y` coordinates, and an `imageID`. We log-normalise the counts
+(`log1p(CP10k)`, PACE's scale) and set a **single `imageID`** for the whole
+section.
+
+```{r build-sce}
+counts <- as.matrix(assay(spe, "counts"))              # genes x cells
+xy     <- spatialCoords(spe)
+
+# QC: drop zero-count cells + genes detected in >= 5% of >= 1 cell type (as PACE).
+ct_chr <- as.character(celltype)
+keep_c <- colSums(counts) > 0
+counts <- counts[, keep_c, drop = FALSE]
+xy     <- xy[keep_c, , drop = FALSE]
+ct_chr <- ct_chr[keep_c]
+
+det <- vapply(cell_types, function(ct) {
+  idx <- which(ct_chr == ct)
+  if (!length(idx)) rep(0, nrow(counts)) else rowMeans(counts[, idx, drop = FALSE] > 0)
+}, numeric(nrow(counts)))
+counts <- counts[apply(det, 1, max) >= min_detection, , drop = FALSE]
+
+# log1p(CP10k) expression (genes x cells).
+lib  <- pmax(colSums(counts), 1)
+expr <- log1p(sweep(counts, 2, lib, "/") * 1e4)
+
+sce <- SingleCellExperiment(
+  assays  = list(intensities = expr, counts = counts),
+  colData = DataFrame(
+    cellType = factor(ct_chr, levels = cell_types),
+    x        = xy[, 1],
+    y        = xy[, 2],
+    imageID  = "BC"                                    # SINGLE image (not the slide/CV-fold)
+  )
+)
+cat(sprintf("%d genes x %d cells; %d image(s)\n",
+            nrow(sce), ncol(sce), length(unique(sce$imageID))))
+```
+
+# Run SpatioMark (raw + contamination-corrected)
+
+`from` = focal cell type (whose marker changes), `to` = neighbour cell type.
+`type = "distances"`: coefficient is with respect to **distance to the nearest**
+neighbour cell, so a **negative** coef means expression rises with *proximity*
+(the sign is flipped relative to PACE's neighbour-abundance slope — handled in
+the comparison).
+
+```{r}
+sce <- getDistances(sce,
+  maxDist = 30,
+  nCores = 8
+)
+
+# sce <- getAbundances(sce,
+#   r = 30,
+#   nCores = 8
+# )
+```
+
+
+```{r spatiomark, cache = TRUE}
+# Cache the heavy calcStateChanges() runs (raw + contamination-corrected) so
+# re-runs LOAD them instead of recomputing. Delete the file to force fresh.
+# Path derived from the already-absolute pace_path (chunks run from the document
+# dir, so a bare relative path would land in notebooks/).
+sm_cache <- file.path(dirname(dirname(pace_path)), "spatiomark_bc_states.rds")
+
+if (file.exists(sm_cache)) {
+  sm         <- readRDS(sm_cache)
+  state_raw  <- sm$state_raw
+  state_corr <- sm$state_corr
+  message("loaded cached SpatioMark results from ", sm_cache)
+} else {
+  # Args match the vignette's all-pairs call; defaults pick up the SCE's colData
+  # (cellType, imageID, x/y) and the first assay ("intensities").
+  state_raw <- calcStateChanges(
+    cells    = sce,
+    type     = "distances",
+    nCores   = 8,
+    minCells = 100
+  )
+
+  # SpatioMark's own lateral marker-spillover correction.
+  sce_c      <- calcContamination(sce)
+  state_corr <- calcStateChanges(
+    cells    = sce_c,
+    type     = "distances",
+    nCores   = 8,
+    minCells = 100,
+    contamination = TRUE
+  )
+
+  saveRDS(list(state_raw = state_raw, state_corr = state_corr), sm_cache)
+  message("saved SpatioMark results to ", sm_cache)
+}
+
+cat(sprintf("raw: %d rows | corrected: %d rows\n", nrow(state_raw), nrow(state_corr)))
+head(state_raw)
+```
+
+# Compare to PACE drivers
+
+For each focal←Tumour pair we take SpatioMark's significant state-change genes
+(`fdr < 0.05`; `from` = focal, `to` = Tumour) and match them to PACE's MCSD
+drivers. Direction is aligned for the distance sign: SpatioMark `coef < 0`
+(up with proximity) ↔ PACE `b_clean > 0` (up with neighbour abundance).
+
+Per gene and pair we keep both the binary calls and the **effect sizes**, so we
+can report overlap that isn't dominated by the count gap: **overlap coefficient**
+(shared / smaller set), a **threshold-free Spearman** of the effect sizes over all
+co-tested genes, the **hypergeometric** overlap p-value, plus direction
+concordance (Jaccard kept for reference).
+
+```{r compare}
+mv <- readRDS(pace_path)
+bc_pairs <- list(c("Stromal", "Tumour"), c("Macrophage", "Tumour"),
+                 c("Endothelial", "Tumour"), c("Myoepithelial", "Tumour"))
+n_universe <- nrow(sce)                       # genes tested (panel)
+
+# PACE: all genes for a pair (threshold-free effect = mash-shrunken slope).
+pace_full <- function(fo, nb) {
+  mv$shrunken_long |>
+    filter(focal == fo, neighbour == nb, term == nb) |>
+    distinct(gene, .keep_all = TRUE) |>
+    transmute(gene, pace_eff = estimate_shrunk, pace_sig = lfsr < 0.05)
+}
+# SpatioMark: all genes for a pair (-coef so +ve = up with proximity, aligned to PACE).
+# NOTE: verify column names against your Statial version (primaryCellType/otherCellType/marker/coef/fdr).
+sm_full <- function(tab, fo, nb) {
+  tab |>
+    filter(primaryCellType == fo, otherCellType == nb) |>
+    distinct(marker, .keep_all = TRUE) |>
+    transmute(gene = marker, sm_eff = -coef, sm_sig = fdr < 0.05)
+}
+merged_arm <- function(tab, arm_label) {
+  bind_rows(lapply(bc_pairs, function(p) {
+    full_join(pace_full(p[1], p[2]), sm_full(tab, p[1], p[2]), by = "gene") |>
+      mutate(arm = arm_label, pair = sprintf("%s <- %s", p[1], p[2]))
+  }))
+}
+genes_tbl <- bind_rows(merged_arm(state_raw,  "SpatioMark"),
+                       merged_arm(state_corr, "SpatioMark+contam"))
+
+comparison <- genes_tbl |>
+  group_by(arm, pair) |>
+  summarise(
+    n_PACE       = sum(pace_sig %in% TRUE),
+    n_SpatioMark = sum(sm_sig %in% TRUE),
+    n_shared     = sum((pace_sig %in% TRUE) & (sm_sig %in% TRUE)),
+    dir_concord  = { sh <- (pace_sig %in% TRUE) & (sm_sig %in% TRUE)
+                     if (sum(sh)) mean(sign(pace_eff[sh]) == sign(sm_eff[sh])) else NA_real_ },
+    spearman_eff = { co <- !is.na(pace_eff) & !is.na(sm_eff)
+                     if (sum(co) > 2) cor(pace_eff[co], sm_eff[co], method = "spearman") else NA_real_ },
+    .groups = "drop") |>
+  mutate(
+    overlap_coef = n_shared / pmax(pmin(n_PACE, n_SpatioMark), 1),       # |A∩B| / min(|A|,|B|)
+    # jaccard      = n_shared / pmax(n_PACE + n_SpatioMark - n_shared, 1),
+    hyper_p      = phyper(n_shared - 1, n_SpatioMark, n_universe - n_SpatioMark, n_PACE, lower.tail = FALSE),
+    across(c(dir_concord, spearman_eff, overlap_coef), ~ round(.x, 3)),
+    hyper_p      = signif(hyper_p, 2)
+  ) |>
+  relocate(arm, pair, n_PACE, n_SpatioMark, n_shared,
+           overlap_coef, spearman_eff, dir_concord, hyper_p)
+comparison
+```
+
+```{r save}
+write.csv(comparison, file.path(out_dir, "spatiomark_vs_pace_bc.csv"), row.names = FALSE)
+write.csv(genes_tbl,  file.path(out_dir, "spatiomark_vs_pace_genes_bc.csv"), row.names = FALSE)
+```
+
+# Visualisation
+
+Two views (raw SpatioMark arm): the overlap of significant drivers per pair, and
+the per-gene **effect-size agreement** (threshold-free) — the latter is the
+strongest cross-check since it ignores the differing significance cutoffs.
+
+```{r compare-viz, fig.width = 11, fig.height = 9}
+# (1) shared / method-only counts per pair
+bar_dat <- comparison |>
+  filter(arm == "SpatioMark") |>
+  transmute(pair,
+            `SpatioMark only` = n_SpatioMark - n_shared,
+            `shared`          = n_shared,
+            `PACE only`       = n_PACE - n_shared) |>
+  pivot_longer(-pair, names_to = "set", values_to = "n") |>
+  mutate(set = factor(set, levels = c("SpatioMark only", "shared", "PACE only")))
+p_bar <- ggplot(bar_dat, aes(n, pair, fill = set)) +
+  geom_col() +
+  scale_fill_manual(values = c("SpatioMark only" = "#F28E2B", shared = "#76B7B2",
+                               "PACE only" = "#4E79A7"), name = NULL) +
+  labs(x = "significant genes", y = NULL,
+       title = "A   Significant drivers per pair (PACE vs SpatioMark)") +
+  theme_bw(base_size = 11) + theme(legend.position = "top")
+
+# (2) per-gene effect-size scatter, shared-significant genes highlighted
+sc <- genes_tbl |>
+  filter(arm == "SpatioMark", !is.na(pace_eff), !is.na(sm_eff)) |>
+  mutate(category = ifelse((pace_sig %in% TRUE) & (sm_sig %in% TRUE), "both significant",
+                    ifelse((pace_sig %in% TRUE) | (sm_sig %in% TRUE), "one method", "neither")))
+rho_lab <- comparison |> filter(arm == "SpatioMark") |>
+  transmute(pair, label = sprintf("rho = %.2f", spearman_eff))
+p_scatter <- ggplot(sc, aes(pace_eff, sm_eff)) +
+  geom_hline(yintercept = 0, colour = "grey85") +
+  geom_vline(xintercept = 0, colour = "grey85") +
+  geom_point(aes(colour = category), alpha = 0.5, size = 1) +
+  geom_text(data = rho_lab, aes(x = -Inf, y = Inf, label = label),
+            hjust = -0.12, vjust = 1.6, inherit.aes = FALSE, size = 3.4) +
+  facet_wrap(~ pair, scales = "free") +
+  scale_colour_manual(values = c("both significant" = "#4E79A7",
+                                 "one method" = "#F28E2B", "neither" = "grey75"), name = NULL) +
+  labs(x = "PACE shrunken slope",
+       y = "SpatioMark effect (−coef; +ve = up with proximity)",
+       title = "B   Effect-size agreement per pair (Spearman over co-tested genes)") +
+  theme_bw(base_size = 11) + theme(legend.position = "top")
+
+fig <- p_bar / p_scatter + plot_layout(heights = c(1, 2.4))
+ggsave(file.path(out_dir, "spatiomark_vs_pace_viz_bc.pdf"), fig,
+       width = 11, height = 9, device = cairo_pdf)
+# fig
+```
+
+# Selection plane — significance vs specificity
+
+Same view as the niche-DE comparison, but shown for **both SpatioMark arms** —
+raw and contamination-corrected. PACE ranks by **MCSD** (effect²·spec²·abundance);
+SpatioMark by **significance** (smallest FDR). The key check: SpatioMark's own
+contamination correction should **thin the low-specificity "SpatioMark top only"
+(orange) cluster** — independent confirmation that those genes are contamination,
+not suppressed biology, and the same genes PACE's specificity weighting demotes.
+PACE's top-5 drivers per pair are labelled.
+
+```{r selection-plane, fig.width = 13, fig.height = 8}
+N_top <- 15
+
+# PACE specificity + MCSD rank for all PACE-significant genes, per pair.
+pace_spec_tbl <- function(fo, nb) {
+  s <- mv$mcsd_canonical[[paste(fo, nb, sep = "_")]]$scores
+  if (is.null(s) || !nrow(s)) return(data.frame())
+  s |> arrange(rank) |> transmute(gene, spec, pace_rank = row_number())
+}
+# SpatioMark significance for an arm: -log10(FDR), ranked, among its significant calls.
+sm_sig_tbl <- function(tab, fo, nb) {
+  tab |>
+    filter(primaryCellType == fo, otherCellType == nb, fdr < 0.05) |>
+    distinct(marker, .keep_all = TRUE) |>
+    mutate(sm_score = -log10(pmax(fdr, 1e-300))) |>
+    arrange(desc(sm_score)) |>
+    mutate(sm_rank = row_number()) |>
+    transmute(gene = marker, sm_score, sm_rank)
+}
+plane_arm <- function(tab, arm_label) {
+  bind_rows(lapply(bc_pairs, function(p) {
+    ps <- pace_spec_tbl(p[1], p[2]); if (!nrow(ps)) return(data.frame())
+    sm <- sm_sig_tbl(tab, p[1], p[2])
+    inner_join(ps, sm, by = "gene") |>          # genes called by BOTH -> a ranking question
+      mutate(arm = arm_label, pair = sprintf("%s <- %s", p[1], p[2]),
+             category = case_when(
+               pace_rank <= N_top & sm_rank <= N_top ~ "both top",
+               sm_rank   <= N_top                    ~ "SpatioMark top only",
+               pace_rank <= N_top                    ~ "PACE top only",
+               TRUE                                  ~ "neither top"))
+  }))
+}
+plane <- bind_rows(plane_arm(state_raw,  "SpatioMark (raw)"),
+                   plane_arm(state_corr, "SpatioMark (+contam)"))
+
+p_plane <- ggplot(plane, aes(spec, sm_score)) +
+  geom_point(aes(colour = category), alpha = 0.65, size = 1.6) +
+  geom_text_repel(data = filter(plane, pace_rank <= 5),
+                  aes(label = gene), size = 2.3, max.overlaps = Inf,
+                  min.segment.length = 0, box.padding = 0.35, seed = 1) +
+  facet_grid(arm ~ pair, scales = "free_y") +
+  scale_colour_manual(values = c("both top" = "#76B7B2", "SpatioMark top only" = "#F28E2B",
+                                 "PACE top only" = "#4E79A7", "neither top" = "grey80"),
+                      name = NULL) +
+  labs(x = "PACE specificity  (data-derived; low = expressed mainly in other cell types)",
+       y = "SpatioMark significance  (−log10 FDR)",
+       title = "Selection plane: significance vs specificity (raw vs contamination-corrected SpatioMark)",
+       subtitle = "Contamination correction should thin the low-specificity 'SpatioMark top only' (orange) cluster") +
+  theme_bw(base_size = 10) + theme(legend.position = "top")
+
+# ggsave(file.path(out_dir, "spatiomark_selection_plane_bc.pdf"), p_plane,
+#        width = 13, height = 8, device = cairo_pdf)
+# p_plane
+```
+
+# Spillover illustration — expression in the neighbour cell type
+
+The specificity axis is PACE-derived. This complements it with a **model-free**
+view: mean log1p(CP10k) expression of each gene in the **focal** cells vs the
+**neighbour (Tumour)** cells. If SpatioMark's significant low-specificity genes
+(orange, "SpatioMark top only") sit **above the diagonal** — higher in Tumour than
+in the focal — then SpatioMark's apparent "focal state change near Tumour" is
+direct evidence of **spillover** from the neighbour, which PACE's specificity
+weighting demotes. Uses the raw SpatioMark arm.
+
+```{r spillover-expr, fig.width = 11, fig.height = 9}
+# Mean log1p(CP10k) expression per gene per cell type (model-free).
+expr_by_ct <- vapply(cell_types, function(ct) {
+  idx <- which(ct_chr == ct)
+  if (!length(idx)) rep(NA_real_, nrow(expr)) else rowMeans(expr[, idx, drop = FALSE])
+}, numeric(nrow(expr)))
+rownames(expr_by_ct) <- rownames(expr)
+
+spill <- bind_rows(lapply(bc_pairs, function(p) {
+  ps <- pace_spec_tbl(p[1], p[2]); if (!nrow(ps)) return(data.frame())
+  sm <- sm_sig_tbl(state_raw, p[1], p[2])
+  inner_join(ps, sm, by = "gene") |>
+    mutate(pair       = sprintf("%s <- %s", p[1], p[2]),
+           focal_expr = expr_by_ct[cbind(gene, p[1])],
+           nbr_expr   = expr_by_ct[cbind(gene, p[2])],
+           category   = case_when(
+             pace_rank <= N_top & sm_rank <= N_top ~ "both top",
+             sm_rank   <= N_top                    ~ "SpatioMark top only",
+             pace_rank <= N_top                    ~ "PACE top only",
+             TRUE                                  ~ "neither top"))
+}))
+
+p_spill <- ggplot(spill, aes(focal_expr, nbr_expr)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey70") +
+  geom_point(aes(colour = category), alpha = 0.5, size = 1.3) +
+  # Label top genes only where expression is meaningful (skip the noisy ~0,0 pile).
+  geom_text_repel(data = filter(spill, category != "neither top",
+                                pmax(focal_expr, nbr_expr, na.rm = TRUE) > 0.5),
+                  aes(label = gene, colour = category), size = 2.3, max.overlaps = Inf,
+                  min.segment.length = 0, box.padding = 0.35, seed = 1, show.legend = FALSE) +
+  facet_wrap(~ pair, scales = "free") +
+  scale_colour_manual(values = c("both top" = "#00A087", "SpatioMark top only" = "#E64B35",
+                                 "PACE top only" = "#3C5488", "neither top" = "grey80"),
+                      name = NULL) +   # ggsci NPG palette
+  labs(x = "mean expression in focal cells  (log1p CP10k)",
+       y = "mean expression in neighbour (Tumour) cells  (log1p CP10k)",
+       title = "Spillover illustration: are SpatioMark-top genes expressed more in the neighbour than the focal?",
+       subtitle = "Above the diagonal = higher in Tumour than focal (spillover-prone); red = SpatioMark top only") +
+  theme_bw(base_size = 11) + theme(legend.position = "top")
+
+ggsave(file.path(out_dir, "spatiomark_spillover_expression_bc.pdf"), p_spill,
+       width = 11, height = 9, device = cairo_pdf)
+# p_spill
+```
+
+# Pair-recurrence — pair-specific or pan-focal (leaking)?
+
+A real neighbour-induced state change should be **pair-specific** (Tumour drives a
+different programme in an endothelial vs a macrophage vs a stromal cell). Pure
+spillover is **pan-focal**: the *same* Tumour genes leak into whatever cell sits
+nearby. So for each method we count, per top gene, **how many of the 4 focal←Tumour
+pairs it is top-`N_top` in**. If SpatioMark's top genes recur across pairs (3–4)
+while PACE's appear in 1, that is direct, quantified evidence that SpatioMark's
+hits are leakage and PACE's are pair-specific drivers.
+
+```{r pair-recurrence, fig.width = 9, fig.height = 5}
+N_top <- 15
+
+# Top-N genes per pair for each method (SpatioMark by significance, PACE by MCSD).
+top_sets <- bind_rows(lapply(bc_pairs, function(p) {
+  pr <- sprintf("%s <- %s", p[1], p[2])
+  sm <- sm_sig_tbl(state_raw, p[1], p[2]) |> arrange(sm_rank) |> head(N_top) |>
+    transmute(gene, method = "SpatioMark", pair = pr)
+  pc <- pace_spec_tbl(p[1], p[2]) |> arrange(pace_rank) |> head(N_top) |>
+    transmute(gene, method = "PACE", pair = pr)
+  bind_rows(sm, pc)
+}))
+
+# How many of the 4 pairs each top gene appears in, per method.
+recur <- top_sets |> distinct(method, gene, pair) |> count(method, gene, name = "n_pairs")
+recur_dist <- recur |> count(method, n_pairs, name = "n_genes")
+
+p_recur <- ggplot(recur_dist, aes(factor(n_pairs), n_genes, fill = method)) +
+  geom_col(position = position_dodge(0.7), width = 0.65) +
+  scale_fill_manual(values = c("PACE" = "#4E79A7", "SpatioMark" = "#F28E2B"), name = NULL) +
+  labs(x = "number of focal←Tumour pairs the gene is top-15 in",
+       y = "number of top genes",
+       title = "Pair-recurrence: SpatioMark's top genes recur across focal types (leakage); PACE's are pair-specific",
+       subtitle = sprintf("Top-%d per pair; 4 = appears in every focal←Tumour pair", N_top)) +
+  theme_bw(base_size = 11) + theme(legend.position = "top")
+
+ggsave(file.path(out_dir, "spatiomark_pair_recurrence_bc.pdf"), p_recur,
+       width = 9, height = 5, device = cairo_pdf)
+p_recur
+
+# The pan-focal (>= 3 pairs) genes per method — the leakage signature vs PACE's specificity.
+recur |> filter(n_pairs >= 3) |> arrange(method, desc(n_pairs), gene) |>
+  group_by(method) |>
+  summarise(n = n(), genes = paste(gene, collapse = ", "), .groups = "drop")
+```
+
+# Macrophage ← Tumour: PACE vs both comparison methods
+
+Two panels on the model-free expression plane, Macrophage ← Tumour only. Left =
+**PACE vs SpatioMark** (contamination-corrected, the default arm); right =
+**PACE vs niche-DE** (unfiltered, so it ranks the same 275-gene universe as PACE).
+Above the diagonal = higher in Tumour than in the macrophage, i.e. spillover-prone.
+PACE's top set sits below the diagonal (genuine macrophage genes) while both
+comparison methods rank Tumour-spillover genes into their top. Reuses
+`pace_spec_tbl` / `sm_sig_tbl` / `expr_by_ct` from above; the unfiltered niche-DE
+cache is built by `nichede_bc.qmd`.
+
+```{r macrophage-2panel, fig.width = 13, fig.height = 7}
+suppressPackageStartupMessages(library(nicheDE))
+
+focal_ct <- "Macrophage"; nbr_ct <- "Tumour"
+comp_dir <- "figures/method_comparison"
+dir.create(comp_dir, showWarnings = FALSE, recursive = TRUE)
+
+# PACE (MCSD) and SpatioMark (+contam) ranks via the notebook's existing helpers.
+pace_r <- pace_spec_tbl(focal_ct, nbr_ct) |> transmute(gene, pace_rank)
+sm_r   <- sm_sig_tbl(state_corr, focal_ct, nbr_ct) |> transmute(gene, comp_rank = sm_rank)
+
+# niche-DE (unfiltered) interaction-p rank for the same pair.
+nde_unf <- readRDS(file.path(dirname(dirname(pace_path)), "nichede_bc_nde_unfiltered.rds"))
+nde_r <- local({
+  ct <- colnames(nde_unf@num_cells); g <- nde_unf@gene_names
+  fi <- which(ct == focal_ct); ni <- which(ct == nbr_ct)
+  p  <- pmin(nde_unf@niche_DE_pval_pos$interaction_level[fi, ni, ],
+             nde_unf@niche_DE_pval_neg$interaction_level[fi, ni, ], na.rm = FALSE)
+  names(p) <- g
+  data.frame(gene = names(p), p = p) |> filter(!is.na(p), p < 1) |>
+    arrange(p) |> transmute(gene, comp_rank = row_number())
+})
+
+# One panel: all panel genes as backdrop, categorised by top-N membership.
+spill_panel <- function(comp_rank, panel_label) {
+  data.frame(gene = rownames(expr_by_ct),
+             focal_expr = expr_by_ct[, focal_ct],
+             nbr_expr   = expr_by_ct[, nbr_ct]) |>
+    left_join(pace_r,    by = "gene") |>
+    left_join(comp_rank, by = "gene") |>
+    mutate(
+      in_pace = !is.na(pace_rank) & pace_rank <= N_top,
+      in_comp = !is.na(comp_rank) & comp_rank <= N_top,
+      category = case_when(
+        in_pace & in_comp ~ "both top",
+        in_comp           ~ "comparator top only",
+        in_pace           ~ "PACE top only",
+        TRUE              ~ "neither top"),
+      panel = panel_label)
+}
+
+spill2 <- bind_rows(
+  spill_panel(sm_r,  "PACE vs SpatioMark"),
+  spill_panel(nde_r, "PACE vs niche-DE")) |>
+  mutate(panel = factor(panel, levels = c("PACE vs SpatioMark", "PACE vs niche-DE")),
+         category = factor(category, levels = c("both top", "comparator top only",
+                                                "PACE top only", "neither top")))
+
+pal2 <- c("both top" = "#00A087", "comparator top only" = "#E64B35",
+          "PACE top only" = "#3C5488", "neither top" = "grey80")   # NPG
+lab2 <- filter(spill2, category != "neither top", pmax(focal_expr, nbr_expr, na.rm = TRUE) > 0.5)
+
+p_spill2 <- ggplot(spill2, aes(focal_expr, nbr_expr)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey70") +
+  geom_point(aes(colour = category), alpha = 0.55, size = 1.5) +
+  geom_text_repel(data = lab2, aes(label = gene, colour = category), size = 2.5,
+                  max.overlaps = Inf, min.segment.length = 0, box.padding = 0.35,
+                  seed = 1, show.legend = FALSE) +
+  facet_wrap(~ panel) +
+  scale_colour_manual(values = pal2, name = NULL,
+                      breaks = c("both top", "comparator top only", "PACE top only"),
+                      labels = c("both top", "comparator (SpatioMark / niche-DE) top only",
+                                 "PACE top only")) +
+  labs(x = "mean expression in focal (Macrophage) cells  (log1p CP10k)",
+       y = "mean expression in neighbour (Tumour) cells  (log1p CP10k)",
+       title = "Macrophage ← Tumour: are the comparison methods' top genes spillover?",
+       subtitle = sprintf("Above the diagonal = higher in Tumour than macrophage (spillover-prone). Top-%d per method; red = comparator top only.", N_top)) +
+  theme_bw(base_size = 12) + theme(legend.position = "top")
+
+ggsave(file.path(comp_dir, "spillover_macrophage_tumour_2panel_bc.pdf"), p_spill2,
+       width = 13, height = 7, device = cairo_pdf)
+p_spill2
+```
+
+# Spillover separation (all methods)
+
+Panel-B construction as a method comparison. A (gene, neighbour) relationship is a
+**neighbour-marker relationship** (candidate spillover, x-axis) if the gene is a
+one-vs-rest AUC ≥ 0.70 marker of that neighbour cell type; otherwise it is a
+**non-marker relationship** (genuine, y-axis). Each method ranks all its
+(gene, focal, neighbour) relationships by `|z|`, and we accumulate non-marker vs
+marker down the ranking; a cleaner method accrues genuine relationships faster
+than contamination. Triangle / dashed = each method's Bonferroni p < 0.05 cutoff.
+Full curve plus a zoom to the first 100 marker (FP) relationships. niche-DE is the
+unfiltered fit, so all four methods span the same relationship universe.
+
+```{r spillover-separation, fig.width = 15, fig.height = 6}
+suppressPackageStartupMessages({library(nicheDE); library(patchwork)})
+comp_dir <- "figures/method_comparison"
+dir.create(comp_dir, showWarnings = FALSE, recursive = TRUE)
+
+# Neighbour-cell-type markers: one-vs-rest AUC >= 0.70. AUC is rank-based, so the
+# log1p(CP10k) `expr` (genes x cells) gives identical markers to raw CP10k.
+auc_one_vs_rest <- function(x, is_type) {
+  n1 <- sum(is_type); n0 <- sum(!is_type)
+  if (n1 == 0 || n0 == 0) return(NA_real_)
+  r <- rank(x); (sum(r[is_type]) - n1 * (n1 + 1) / 2) / (n1 * n0)
+}
+genes_panel <- rownames(expr)
+markers <- bind_rows(lapply(cell_types, function(ct) {
+  is_ct <- ct_chr == ct
+  auc <- vapply(genes_panel, function(g) auc_one_vs_rest(expr[g, ], is_ct), numeric(1))
+  data.frame(gene = genes_panel, marker_ct = ct, auc = auc)
+})) |> filter(auc >= 0.70)
+marker_set <- split(markers$marker_ct, markers$gene)
+
+# Per-method (gene, focal, neighbour, z) relationship tables.
+pace_ztbl <- local({
+  U <- mv$fit$U; SE <- mv$fit$se_U; gn <- colnames(U)
+  parts <- strsplit(rownames(U), "::", fixed = TRUE)
+  fo <- vapply(parts, `[`, "", 1L); tm <- vapply(parts, `[`, "", 2L)
+  keep <- which(fo %in% cell_types & tm %in% cell_types & tm != fo)
+  bind_rows(lapply(keep, function(i) data.frame(gene = gn, focal = fo[i], neighbour = tm[i],
+    z = as.numeric(U[i, ]) / pmax(as.numeric(SE[i, ]), 1e-8))))
+}) |> filter(gene %in% genes_panel)
+
+sm_ztbl <- function(tab) tab |>
+  filter(primaryCellType %in% cell_types, otherCellType %in% cell_types,
+         primaryCellType != otherCellType, marker %in% genes_panel, is.finite(tval)) |>
+  transmute(gene = marker, focal = primaryCellType, neighbour = otherCellType, z = tval)
+
+nde_ztbl <- local({
+  ct <- colnames(nde_unf@num_cells); g <- nde_unf@gene_names
+  ip <- nde_unf@niche_DE_pval_pos$interaction_level
+  ineg <- nde_unf@niche_DE_pval_neg$interaction_level
+  rows <- list()
+  for (fo in cell_types) for (nb in setdiff(cell_types, fo)) {
+    fi <- which(ct == fo); ni <- which(ct == nb)
+    p <- pmin(ip[fi, ni, ], ineg[fi, ni, ], na.rm = FALSE); ok <- which(!is.na(p) & p < 1)
+    if (length(ok)) rows[[paste(fo, nb)]] <-
+      data.frame(gene = g[ok], focal = fo, neighbour = nb, z = qnorm(1 - p[ok] / 2))
+  }
+  bind_rows(rows) |> filter(gene %in% genes_panel)
+})
+
+sep_arms <- list("PACE" = pace_ztbl, "niche-DE" = nde_ztbl,
+                 "SpatioMark (+contam)" = sm_ztbl(state_corr),
+                 "SpatioMark (raw)" = sm_ztbl(state_raw))
+sep_levels <- names(sep_arms)
+
+# Rank by |z|, accumulate marker (FP) vs non-marker (genuine) relationships.
+sep_curve <- function(tab) {
+  tab <- tab[order(-abs(tab$z)), ]
+  is_marker <- mapply(function(g, nb) !is.null(marker_set[[g]]) && nb %in% marker_set[[g]],
+                      tab$gene, tab$neighbour)
+  data.frame(absz = abs(tab$z),
+             marker_rel = cumsum(is_marker), nonmarker_rel = cumsum(!is_marker))
+}
+sep <- bind_rows(lapply(sep_levels, function(a) sep_curve(sep_arms[[a]]) |> mutate(arm = a))) |>
+  mutate(arm = factor(arm, levels = sep_levels))
+cut_pts <- bind_rows(lapply(sep_levels, function(a) {
+  d <- sep[sep$arm == a, ]; zt <- qnorm(1 - 0.05 / (2 * nrow(d))); i <- which(d$absz >= zt)
+  (if (!length(i)) data.frame(marker_rel = 0, nonmarker_rel = 0)
+   else d[max(i), c("marker_rel", "nonmarker_rel")]) |> mutate(arm = a)
+})) |> mutate(arm = factor(arm, levels = sep_levels))
+
+arm_colour <- c("PACE" = "#1E88E5", "niche-DE" = "#F28E2B",
+                "SpatioMark (+contam)" = "#E15759", "SpatioMark (raw)" = "#9C755F")
+sep_theme <- theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"),
+        legend.position = c(0.02, 0.98), legend.justification = c(0, 1),
+        legend.background = element_rect(fill = "white", colour = "grey80"),
+        legend.key.size = unit(0.9, "lines"), panel.grid.minor = element_blank())
+sep_layers <- function() list(
+  geom_line(linewidth = 1),
+  geom_segment(data = cut_pts, aes(x = marker_rel, xend = marker_rel,
+                                   y = 0, yend = nonmarker_rel),
+               linetype = "dashed", linewidth = 0.5, alpha = 0.8),
+  geom_point(data = cut_pts, shape = 17, size = 2.4),
+  scale_colour_manual(values = arm_colour, name = "Method"))
+
+pB <- ggplot(sep, aes(marker_rel, nonmarker_rel, colour = arm)) + sep_layers() +
+  labs(x = "Neighbour cell type marker relationships", y = "Non marker relationships",
+       title = "B   Spillover separation (full)",
+       subtitle = "dashed / triangle = Bonferroni p < 0.05 cutoff (per method); niche-DE unfiltered") +
+  sep_theme
+fp_cap <- 100; yz <- max(sep$nonmarker_rel[sep$marker_rel <= fp_cap]) * 1.04
+pB_zoom <- ggplot(sep, aes(marker_rel, nonmarker_rel, colour = arm)) + sep_layers() +
+  coord_cartesian(xlim = c(0, fp_cap), ylim = c(0, yz), expand = FALSE) +
+  labs(x = "Neighbour cell type marker relationships", y = "Non marker relationships",
+       title = "B   Spillover separation (first 100 FP)") +
+  sep_theme + theme(legend.position = "none")
+
+ggsave(file.path(comp_dir, "spillover_separation_methods_bc.pdf"), pB | pB_zoom,
+       width = 15, height = 6, device = cairo_pdf)
+pB | pB_zoom
+```
+
+# Write the PDFs to file
+```{r}
+pdf("figures/spatiomark/spatioMark_all.pdf", width = 12, height = 8)
+fig
+p_plane
+p_spill
+dev.off()
+```
+

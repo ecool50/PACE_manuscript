@@ -1,0 +1,701 @@
+---
+title: "PACE-MV — Melanoma (SIMVI CosMx) analysis"
+author: "Elijah Willie"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: show
+    code-tools: true
+    fig-width: 8
+    fig-height: 5
+    df-print: paged
+    embed-resources: true
+execute:
+  echo: true
+  warning: false
+  message: false
+editor:
+  markdown:
+    wrap: 72
+---
+
+SIMVI melanoma ICI-response CosMx panel, analysed end-to-end with the
+**current canonical PACE-MV pipeline** (per-cell-HC contamination model,
+NB1 dispersion, per-image frNN kernels). The disease contrast is
+**PD (progressive disease) vs non-PD (SD + PR + CR)** — matching SIMVI's
+PD-vs-nonPD contrast and using **all 26 images / 25 patients** (PD is the
+case group; SD is kept on the non-PD side rather than dropped). The six
+tumour sub-clusters are collapsed into one `Tumour` label, and the T-cell
+subtypes (CD8 memory, CD8 naive, Treg) are pooled into one `T_Cell`, giving
+6 cell types.
+
+The inferential target here is **V_R×S** — the *disease-modulated*
+spatial slope: does a focal cell type's expression response to a
+neighbour type *differ between PD and non-PD*? That signal lives in the
+`ResponderPD:<neighbour>` random-slope interactions.
+
+This notebook mirrors the canonical builder
+`scripts/builders/mel_fit_joint_kernel_pathA_collapsed7_redesign.R`.
+
+> NOTE (relocked 2026-06-16): the Mel canonical `mvpql_percell_hc.rds`
+> is now **per-image frNN**, matching this notebook and the builder. The
+> previous per-image get.knn(k=50) fit truncated the dense CosMx FOVs and
+> is kept as `mvpql_percell_hc_getknn.rds` (sensitivity). frNN recovers
+> more signal (42 vs 22 lfsr\<0.05 slopes); the SPP1 Mac←Tumour flagship
+> is unchanged (b −0.064, lfsr 0).
+
+# Setup
+
+`scripts/zzz.R` auto-sources `scripts/core/` then `scripts/helpers/`.
+Constants are the canonical Mel knobs (NB1; no `R_DISP_MODEL` override).
+
+| Constant | Meaning |
+|----|----|
+| `h_tech = 5 µm` | optical-bleed kernel scale |
+| `h_bio = 30 µm` | biological-proximity kernel scale |
+| `kernel_radius = 3·h_bio = 90 µm` | per-image frNN radius (uncapped) |
+| `px_size = 0.12028` | CosMx pixel → µm conversion |
+| `min_detection = 0.05` | gene QC: detected in ≥5% of ≥1 cell type |
+| `min_neff = 30` | drop (focal,nb) kernel cols with effective n \< 30 |
+| `n_iter = 32` | PQL outer iterations |
+
+```{r setup}
+rm(list = ls())
+gc()
+
+suppressPackageStartupMessages({
+  # tidyverse + plotting
+  library(dplyr)
+  library(tibble)
+  library(tidyr)
+  library(ggplot2)
+  library(stringr)
+  library(forcats)
+  library(patchwork)
+  # matrices, parallelism, neighbour search
+  library(Matrix)
+  library(BiocParallel)
+  library(FNN)
+  library(dbscan)
+  # model + shrinkage
+  library(glmmTMB)
+  library(mashr)
+  # data containers (CosMx h5ad)
+  library(zellkonverter)
+  library(SingleCellExperiment)
+  library(SummarizedExperiment)
+})
+options(dplyr.summarise.inform = FALSE)
+
+# Run from pace_mv/ wherever this notebook is launched: here::here() finds the
+# repo root (via lateral_spillover.Rproj), then we descend into pace_mv/.
+setwd("../../pace_mv")
+
+# scripts/zzz.R auto-sources scripts/core + scripts/helpers and compiles the C++;
+# then the streaming solver and the pipeline.
+source("scripts/zzz.R")                              # auto-loads scripts/ (core + helpers + C++)
+source("scripts/core/06a-plots-decomp.R")            # decomp plot fns: zzz's numbered loader skips 06a/b/c/d
+source("streaming/helpers/pace_mvpql_streaming.R")   # streaming solver (lives outside scripts/helpers/)
+source("stage0/pace_core.R")                         # the pipeline functions
+
+# ---- canonical model knobs (Mel per-cell-HC, NB1, per-image frNN) ----
+h_tech        <- 5             # optical-bleed kernel scale (µm)
+h_bio         <- 30            # biological-proximity kernel scale (µm)
+kernel_radius <- 3 * h_bio     # per-image frNN truncation radius (µm)
+px_size       <- 0.12028       # CosMx pixel -> µm
+min_detection <- 0.05          # gene QC threshold
+min_neff      <- 30            # drop (focal, neighbour) kernel cols below this
+n_iter        <- 32            # PQL outer iterations
+tau_shrinkage <- "adaptive"    # empirical-Bayes pooling of variance components
+pql_threads   <- 4
+
+# 6 cell types: six Tumor sub-clusters -> "Tumour"; T-cell subtypes -> "T_Cell".
+cell_types     <- c("Tumour", "Endothelial", "Fibroblast", "Macrophage",
+                    "B_Cell", "T_Cell")
+tumour_subtypes <- c("Tumor_a", "Tumor_b", "Tumor_c", "Tumor_d", "Tumor_e", "Tumor_f")
+
+# Responder coding (SIMVI PD-vs-nonPD): keep ALL; non-PD = SD+PR+CR (reference),
+# PD = case. resp_term "ResponderPD" -> the V_R×S interaction.
+resp_ref  <- "nonPD"
+resp_case <- "PD"
+resp_term <- paste0("Responder", resp_case)   # "ResponderPD"
+
+h5ad_path   <- "../../data/simvi_melanoma/14708000/Melanoma_5612.h5ad"
+output_path <- "../../data/simvi_melanoma/sweeps/mvpql_percell_hc_notebook.rds"
+```
+
+The model + reporting come from `stage0/pace_core.R` (`pace_fit_streaming()`,
+`pace_shrink()`, `pace_decompose()`, `pace_top_drivers()`); figure helpers live
+in `scripts/helpers/` and are auto-sourced in the setup chunk.
+
+# Load, clean, and collapse to 6 cell types
+
+Read the `Melanoma_5612.h5ad`, keep **all** valid responses (PD/SD/CR/PR),
+recode to **PD vs non-PD** (non-PD = SD+PR+CR), convert pixel coords to
+µm, harmonise cell-type labels, collapse the six `Tumor_*` sub-clusters
+into `Tumour`, and pool the T-cell subtypes (CD8 memory, CD8 naive, Treg)
+into `T_Cell`.
+
+```{r load}
+sce <- readH5AD(h5ad_path, reader = "R")
+assayNames(sce)[assayNames(sce) == "X"] <- "counts"
+set.seed(1994)
+
+# Keep all valid responses; PD vs non-PD (SD + PR + CR).
+keep_response <- sce$BEST_RESPONSE_BY_SCAN %in% c("PD", "SD", "CR", "PR")
+sce <- sce[, which(keep_response)]
+sce$BEST_RESPONSE_BY_SCAN <- ifelse(
+  as.character(sce$BEST_RESPONSE_BY_SCAN) == "PD",
+  "PD", "nonPD"
+)
+
+# Flat cell-level data frame: metadata + counts + spatial coords (px -> µm).
+df_raw <- cbind(colData(sce),
+                t(as.matrix(assay(sce, "counts"))),
+                reducedDim(sce, "spatial")) |>
+  as.data.frame() |>
+  mutate(imageID = paste(SPID, fov, sep = "_"),
+         x = V1 * px_size,
+         y = V2 * px_size) |>
+  mutate(celltype = make.names(celltype),
+         BEST_RESPONSE_BY_SCAN = droplevels(as.factor(BEST_RESPONSE_BY_SCAN)),
+         cell_ID = paste0(cell_ID, "_", fov))
+
+# Harmonise label spelling, then collapse tumour sub-clusters.
+df_raw$celltype <- recode(df_raw$celltype,
+  `B.cell`       = "B_Cell",
+  `T.CD8.memory` = "T_Cell",
+  `T.CD8.naive`  = "T_Cell",
+  `Treg`         = "T_Cell",
+  `endothelial`  = "Endothelial",
+  `fibroblast`   = "Fibroblast",
+  `macrophage`   = "Macrophage")
+# Pool any other T-cell subtype label (e.g. a stray T.CD4) into T_Cell so the
+# combine is complete; print what was folded for transparency.
+t_other <- unique(grep("^T\\.", df_raw$celltype, value = TRUE))
+if (length(t_other)) {
+  message("folding extra T-cell labels into T_Cell: ", paste(t_other, collapse = ", "))
+  df_raw$celltype[df_raw$celltype %in% t_other] <- "T_Cell"
+}
+n_tumour_collapsed <- sum(df_raw$celltype %in% tumour_subtypes)
+df_raw$celltype <- ifelse(df_raw$celltype %in% tumour_subtypes, "Tumour", df_raw$celltype)
+
+df_raw <- df_raw |> filter(celltype %in% cell_types)
+df_raw$imageID <- as.character(df_raw$imageID)
+df_raw$cell_id <- as.character(df_raw$cellID_str)
+panel_genes <- make.names(rownames(sce))
+
+cat(sprintf("collapsed %s tumour cells; retained %s cells\n",
+            format(n_tumour_collapsed, big.mark = ","),
+            format(nrow(df_raw), big.mark = ",")))
+print(table(df_raw$celltype))
+```
+
+# Gene filter + assemble `Y` / `df`
+
+Keep genes detected in ≥5% of ≥1 cell type, drop zero-count cells, order
+cells by image (so the per-image kernel and RE row order are consistent),
+and set the `Responder` factor (non-PD reference). The neighbour kernels,
+the `E^tech` ambient, the anchors, and the fit are all built **inside**
+`pace_fit_streaming()` below.
+
+```{r assemble}
+df_raw <- df_raw[order(df_raw$imageID), ]   # per-image kernel + RE row order
+
+# Gene QC (detection in >= 1 cell type), computed in chunks to bound memory.
+genes_in_df   <- intersect(panel_genes, names(df_raw))
+celltype_chr  <- as.character(df_raw$celltype)
+cells_by_type <- lapply(cell_types, function(ct) which(celltype_chr == ct))
+max_detection <- numeric(length(genes_in_df)); names(max_detection) <- genes_in_df
+chunk_size <- 50L
+for (start in seq.int(1L, length(genes_in_df), by = chunk_size)) {
+  stop_i   <- min(start + chunk_size - 1L, length(genes_in_df))
+  detected <- as.matrix(df_raw[, genes_in_df[start:stop_i], drop = FALSE]) > 0
+  for (j in seq_len(stop_i - start + 1L)) {
+    per_type <- vapply(cells_by_type, function(idx)
+      if (length(idx) == 0L) 0 else mean(detected[idx, j]), numeric(1))
+    max_detection[start + j - 1L] <- max(per_type)
+  }
+  rm(detected)
+}
+invisible(gc(verbose = FALSE))
+genes_in_df   <- genes_in_df[max_detection >= min_detection]
+df_raw$nCount <- rowSums(as.matrix(df_raw[, genes_in_df, drop = FALSE]))
+df_raw        <- df_raw[df_raw$nCount > 0, ]
+
+# Modelling frame + integer counts.
+df <- df_raw
+df$celltype    <- factor(as.character(df$celltype), levels = cell_types)
+df$imageID     <- factor(as.character(df$imageID))
+df$Responder   <- forcats::fct_relevel(as.factor(df$BEST_RESPONSE_BY_SCAN), resp_ref)
+df$.resp_dummy <- as.integer(df$Responder == resp_case)
+Y <- as.matrix(df[, genes_in_df, drop = FALSE]); storage.mode(Y) <- "integer"
+
+cat(sprintf("%s cells, %d genes, %d images\n",
+            format(nrow(df), big.mark = ","), length(genes_in_df), nlevels(df$imageID)))
+print(table(df$Responder))
+```
+
+# PACE fit (per-cell-HC, streaming pipeline)
+
+The **same** `pace_fit_streaming()` that fits BC fits Mel — the
+differences are purely arguments: a **Responder** disease contrast
+(`condition_col`), per-patient images (`kernel_per_image = TRUE`), an
+`imageID` intercept random-effects block (`image_re = "intercept"`), and
+**NB1** dispersion. Internally it builds the per-image neighbour kernels,
+the `E^tech` ambient (streamed as `ambient_W %*% Y`), the homotypic-core
+negative-control anchors, data-informed τ, and the PQL fit.
+
+```{r pace, cache = TRUE}
+res <- pace_fit_streaming(
+  Y = Y, df = df, types = cell_types,
+  celltype_col = "celltype", image_col = "imageID", coord_cols = c("x", "y"),
+  h_bio = h_bio, h_tech = h_tech, eps = kernel_radius,
+  contamination     = "percell_hc",   # mu = mu_bio + rho_i * a_ig
+  dispersion        = "nb1",          # Mel canonical: NB1
+  condition_col     = "Responder",    # PD vs non-PD disease contrast
+  kernel_per_image  = TRUE,           # images = patients (no cross-FOV neighbours)
+  image_re          = "intercept",    # imageID random intercept (donor effect)
+  drop_sparse_neff  = min_neff,
+  within_image      = TRUE,
+  edge_correct      = TRUE,
+  data_informed_tau = TRUE,
+  n_iter = n_iter, threads = pql_threads, tau_shrinkage = tau_shrinkage,
+  verbose = TRUE
+)
+
+# Bind the pieces the reporting + figures read by name.
+fit     <- res$fit
+df      <- res$df            # working frame (kernel columns added)
+Y       <- res$Y
+X_fixed <- res$X_fixed
+K_tech  <- res$K_tech
+K_bio   <- res$K_bio
+```
+
+# mashr + decomposition + MCSD (V_R×S)
+
+`pace_shrink()` shrinks the BLUPs (`resp_term = "ResponderPD"` flags the
+disease-modulated slopes); `pace_decompose()` partitions variance into
+Cell type / Spatial state / Responder spatial / Spillover / Residual;
+`pace_top_drivers()` ranks each pair's genes on the
+`ResponderPD:<neighbour>` interaction (baseline `V_S` from the raw BLUP,
+disease-modulated `V_RxS` from the shrunken interaction slope).
+
+```{r downstream}
+shrunken_long <- pace_shrink(fit, cell_types, resp_term = resp_term)
+decomp        <- pace_decompose(fit, df, Y, cell_types, X_fixed, resp_term = resp_term)
+gene_decomp   <- decomp$gene_focal_5block
+```
+
+```{r mcsd}
+# ALL ordered focal != neighbour pairs (omit `pairs=`). The flagship responder
+# focal<-Tumour pairs are only a reporting subset, not part of the method.
+pair_drivers <- pace_top_drivers(
+  fit, shrunken_long, decomp, cell_types,
+  resp_term = resp_term, resp_dummy = df$.resp_dummy
+)
+
+for (pair_key in names(pair_drivers)) {
+  top_genes <- head(pair_drivers[[pair_key]]$scores$gene, 8)
+  cat(sprintf("%s  n_sig=%d  (%s): %s\n", pair_key,
+              nrow(pair_drivers[[pair_key]]$scores),
+              pair_drivers[[pair_key]]$status, paste(top_genes, collapse = ", ")))
+}
+```
+
+# Variance-component (τ) diagnostic
+
+`τ` is the empirical-Bayes prior variance of each random-effect coefficient —
+how much that *(focal × term)* effect varies across genes. The **`(Intercept)`
+column is cell-type identity** (large τ); the neighbour-slope and
+`Responder:<neighbour>` columns are mostly ≈0 (shrunk away), leaving a short
+tail of flagship pairs. A health-check that the shrinkage is large where it
+should be and ≈0 elsewhere.
+
+```{r tau-diagnostic, fig.width = 14, fig.height = 5}
+p.tau <- plot_tau_diagnostic(fit)   # Mel celltype block, 6 focals (incl. Responder interactions)
+```
+
+# Patient-level disease test (two-stage)
+
+`pace_twostage_z` is PACE's intrinsic donor-level test: for each
+`(focal, neighbour, gene)` it asks whether the within-tissue slope is
+*consistent across donors* in its claimed PD direction, then BH-adjusts
+to `q_pair`. Triples with `q_pair < 0.10` are donor-robust (not just
+cell-level pooling artefacts).
+
+```{r twostage}
+twostage_disease <- tryCatch(
+  pace_twostage_z(
+    fit, raw_Y = Y,
+    cluster_vec = as.character(df$imageID),
+    cond_vec    = as.character(df$Responder),
+    case_level  = resp_case,
+    libsize     = df$nCount
+  ),
+  error = function(e) { message(conditionMessage(e)); NULL }
+)
+
+if (!is.null(twostage_disease)) {
+  cat(sprintf("triples: %d   q_pair<0.10: %d\n",
+              nrow(twostage_disease),
+              sum(twostage_disease$q_pair < 0.10, na.rm = TRUE)))
+}
+```
+
+```{r bundle}
+# Bundle for downstream figure scripts.
+cell_meta <- data.frame(
+  cell_id   = as.character(seq_len(nrow(df))),
+  nCount    = df$nCount,
+  Condition = as.character(df$Responder),
+  patientID = as.character(df$imageID),
+  imageID   = as.character(df$imageID),
+  celltype  = as.character(df$celltype),
+  stringsAsFactors = FALSE
+)
+
+mv <- list(
+  fit = fit, shrunken_long = shrunken_long, gene_set = colnames(Y),
+  decomposition = decomp, mcsd_canonical = pair_drivers,
+  twostage_disease = twostage_disease,
+  h_tech = h_tech, h_bio = h_bio, K_tech = K_tech, K_bio = K_bio,
+  cell_meta = cell_meta
+)
+```
+
+# Per-pair driver composites
+
+`make_pair_composite()` (`scripts/core/06a-plots-decomp.R`) renders Panel C
+(top-MCSD drivers of the responder×spatial differential) and Panel D (per-gene
+single-frame decomposition). Being a condition cohort, the single-frame is
+**condition-aware** and carries an extra **Responder spatial state** block. The
+responder×spatial signal is sparse here — only **SPP1** (Macrophage←Tumour)
+reaches lfsr < 0.05 — which the figure shows honestly.
+
+```{r single-frame}
+# CANONICAL single-frame per-(gene, focal) decomposition (observed denominator).
+# single_frame_decomp_obs() detects the 5-block (V_state_responder) and adds the
+# Responder spatial state block automatically.
+mv$decomposition$gene_focal_single_frame <- single_frame_decomp_obs(
+  Y, df$celltype, df$nCount, mv$decomposition$gene_focal_5block)
+sf <- mv$decomposition$gene_focal_single_frame
+```
+
+**Per-focal decomposition (bar + zoom).** Single-frame block % per focal cell
+type, pooled across genes by the observed denominator (BC-consistent), via the
+locked `plot_stacked_bar_focal()`. Full stack plus a zoom of the small Spatial /
+Responder-spatial / Spillover blocks. The **Responder spatial state** block is
+the disease-modulated (PD vs non-PD) spatial signal, absent in the BC cohort.
+
+```{r decomp-bar, fig.width = 14, fig.height = 6.5}
+blks_all <- sf |>
+  group_by(focal) |>
+  summarise(
+    `Cell type`               = sum(`Cell type %`/100         * denom) / sum(denom),
+    `Spatial cell state`      = sum(`Spatial %`/100           * denom) / sum(denom),
+    `Responder spatial state` = sum(`Responder spatial %`/100 * denom) / sum(denom),
+    `Spillover`               = sum(`Spillover %`/100         * denom) / sum(denom),
+    `Residuals`               = sum(`Residual %`/100          * denom) / sum(denom),
+    .groups = "drop") |>
+  pivot_longer(-focal, names_to = "block", values_to = "pct_total")
+
+p.decomp <- plot_stacked_bar_focal(
+  blks_all,
+  block_levels = c("Cell type", "Spatial cell state", "Responder spatial state",
+                   "Spillover", "Residuals"),
+  title = "Per-focal decomposition (Mel, Responder = PD vs non-PD)",
+  zoom_blocks = c("Spatial cell state", "Responder spatial state", "Spillover"))
+p.decomp
+```
+
+**Pairwise Responder x Spatial % heatmap.** Each cell = the % of the focal
+type's TOTAL variance attributable to the (PD x neighbour) interaction: the
+focal's Responder-spatial block (bar above) split across neighbours by the
+signed Pratt (1987) pair share (`within_focal_share_pct x focal_RxS`). Mirrors
+the canonical `decomp_canonical_mel_percell.R` panel.
+
+```{r decomp-heatmap, fig.width = 7, fig.height = 6}
+# make_pair_tile() lives in scripts/figures/mvpql_pair_heatmap.R (not auto-sourced);
+# defined here so the notebook is self-contained, matching the canonical figure.
+make_pair_tile <- function(d, ttl, fill_lbl = "Variance share", subtitle = NULL) {
+  d |>
+    mutate(focal     = str_replace_all(focal, "[\\._]", " "),
+           neighbour = str_replace_all(neighbour, "[\\._]", " "),
+           pair_pct  = ifelse(focal == neighbour, NA_real_, pair_pct)) |>
+    ggplot(aes(focal, neighbour, fill = pair_pct)) +
+    geom_tile(colour = "grey92", linewidth = 0.3) +                 # match bc: bordered tiles
+    geom_text(aes(label = ifelse(is.na(pair_pct), "",
+                                 ifelse(abs(pair_pct) < 0.005, "0.00", sprintf("%.2f", pair_pct)))),
+              size = 2.4, colour = "white") +                        # match bc: white value labels
+    scale_fill_viridis_c(option = "inferno", na.value = "white",    # match bc: inferno (not magma)
+                         labels = function(x) sprintf("%.2f%%", x)) +
+    coord_equal() +
+    labs(x = "Focal", y = "Neighbour", fill = fill_lbl, title = ttl, subtitle = subtitle) +
+    theme_classic(base_size = 11) +                                 # match bc: theme_classic
+    theme(axis.text.x = element_text(angle = 45, hjust = 1),
+          plot.title = element_text(hjust = 0.5, face = "bold"),
+          plot.subtitle = element_text(hjust = 0.5, colour = "grey30", size = 9,
+                                        margin = margin(b = 6)))
+}
+
+pratt_res <- pace_pair_variance_pratt(
+  mv, cond_prefix = "ResponderPD", cohort_label = "Mel", block_label = "RxS")
+
+# Focal Responder-spatial block share (% of total), from the bar above.
+focal_rxs_pct <- blks_all |>
+  filter(block == "Responder spatial state") |>
+  transmute(focal, focal_rxs = pct_total * 100)
+
+mel_pp <- pratt_res$pair_long |>
+  left_join(focal_rxs_pct, by = "focal") |>
+  mutate(pair_pct = within_focal_share_pct * focal_rxs / 100) |>
+  select(focal, neighbour, pair_pct)
+
+p.heat <- make_pair_tile(
+  mel_pp,
+  "Melanoma: Responder x Spatial contribution (PD vs non-PD)",
+  subtitle = "% of pooled within-celltype variance from the (PD x neighbour) interaction")
+p.heat
+```
+
+**Strong/weak split of the Pratt pair variance.** The (PD x neighbour) differential
+is sparse (few significant genes), so the raw Pratt above can carry pairs whose
+signal is dominated by non-driver genes. We split each pair's per-gene Pratt into
+a STRONG component (significant driver genes, lfsr < 0.05) and a WEAK component
+(the rest), per the strong-localized / weak-diffuse partition
+(Nan-Azriel-Schwartzman 2026). STRONG + WEAK reproduces the total; the STRONG
+panel is the null-robust fill and WEAK flags null-carried pairs (which are common
+in the sparse differential). `pace_pair_variance_pratt_strong_weak()` is
+auto-sourced from `scripts/helpers/` and does not modify the locked Pratt helper.
+
+```{r decomp-heatmap-strong-weak, fig.width = 7, fig.height = 6}
+# Same denominator + focal_rxs scaling as the total-Pratt heatmap above, per component.
+pratt_sw <- pace_pair_variance_pratt_strong_weak(
+  mv, cond_prefix = "ResponderPD", cohort_label = "Mel") |>
+  left_join(focal_rxs_pct, by = "focal") |>
+  group_by(focal) |>
+  mutate(denom      = sum(V_pair_pratt),
+         strong_pct = focal_rxs * V_pair_strong / denom,
+         weak_pct   = focal_rxs * V_pair_weak   / denom,
+         pair_pct   = focal_rxs * V_pair_pratt  / denom) |>
+  ungroup()
+
+# Table: top pairs by the null-robust STRONG share (self-pairs excluded).
+pratt_sw |>
+  filter(as.character(focal) != as.character(neighbour)) |>
+  transmute(focal, neighbour, n_strong, pair_pct, strong_pct, weak_pct,
+            pct_from_strong = 100 * V_pair_strong / V_pair_pratt) |>
+  arrange(desc(strong_pct)) |>
+  mutate(across(c(pair_pct, strong_pct, weak_pct, pct_from_strong), \(x) round(x, 3))) |>
+  head(12) |>
+  knitr::kable(caption = "Mel Pratt pair % split: STRONG (drivers) vs WEAK (nulls)")
+
+# STRONG-filled heatmap (null-robust), reusing the canonical make_pair_tile().
+p.heat_strong <- make_pair_tile(
+  pratt_sw |> transmute(focal, neighbour, pair_pct = strong_pct),
+  "Melanoma: Responder x Spatial — strong-localized (driver-gene) Pratt",
+  subtitle = "driver-gene (lfsr<0.05) share of the (PD x neighbour) interaction variance")
+p.heat_strong
+
+# Persist the strong/weak decomposition on the fit object (saved at the end).
+mv$pratt_strong_weak <- pratt_sw
+```
+
+```{r pair-composite, fig.width = 12, fig.height = 5}
+# Macrophage <- Tumour carries the one responder-differential driver (SPP1).
+# Change the pair to render any of mv$mcsd_canonical (most are empty here).
+make_pair_composite("Macrophage", "Tumour", mv, sf, n_top = 5)
+```
+
+<!-- The refit is persisted at the end of the notebook (see the "Save" section). -->
+
+# Variance decomposition
+
+Per-focal 5-block variance partition (% of within-focal latent
+variance), pooled across genes.
+
+```{r block-vpc}
+gene_decomp |>
+  mutate(
+    total = celltype_offset_sq + V_state_baseline + V_state_responder + V_spill + V_disp,
+    `Cell type %`        = 100 * celltype_offset_sq / pmax(total, 1e-12),
+    `Spatial state %`    = 100 * V_state_baseline   / pmax(total, 1e-12),
+    `Responder spatial %`= 100 * V_state_responder  / pmax(total, 1e-12),
+    `Spillover %`        = 100 * V_spill            / pmax(total, 1e-12),
+    `Residual %`         = 100 * V_disp             / pmax(total, 1e-12)
+  ) |>
+  group_by(focal) |>
+  summarise(across(c(`Cell type %`, `Spatial state %`, `Responder spatial %`,
+                     `Spillover %`, `Residual %`), ~ round(mean(.x), 1))) |>
+  arrange(desc(`Responder spatial %`))
+```
+
+# Top driver genes per pair (flagships)
+
+MCSD-ranked disease-modulated drivers (lfsr \< 0.05). `b_clean` =
+mash-shrunken `ResponderPD:Tumour` slope; `R2_RxS` = per-gene share of
+the disease-modulated spatial variance.
+
+```{r fib-tum}
+pair_drivers$Fibroblast_Tumour$scores |>
+  head(12) |>
+  select(rank, gene, MCSD, b_clean, spec, focal_mean, R2_RxS, lfsr)
+```
+
+```{r mac-tum}
+pair_drivers$Macrophage_Tumour$scores |>
+  head(12) |>
+  select(rank, gene, MCSD, b_clean, spec, focal_mean, R2_RxS, lfsr)
+```
+
+```{r fib-endo}
+pair_drivers$Fibroblast_Endothelial$scores |>
+  head(12) |>
+  select(rank, gene, MCSD, b_clean, spec, focal_mean, R2_RxS, lfsr)
+```
+
+# SPP1 macrophage population view (PACE slope)
+
+Population view of the flagship SPP1 Macrophage←Tumour pair: SPP1 expression
+in macrophages against raw tumour-neighbour density, split by ICI response.
+The **solid** line + ribbon is the observed data (binned means ± SE); the
+**dashed** line is the PACE slope read straight from `fit$U` (the
+`Macrophage::Tumour` main slope for non-PD, plus the `ResponderPD:Tumour`
+interaction for PD) — not an OLS / `geom_smooth` fit. The PACE slope is a
+slope per unit density on the latent log-mean scale; `log1p(CP10K)` approximates
+that scale, so the dashed line uses the PACE slope anchored at each group's data
+centroid. The contrast between the steep blue *data* and the near-flat blue
+*PACE slope* is the point: the raw rise is between-patient structure that PACE
+removes via within-image centring.
+
+```{r spp1-population-figure, fig.width = 10, fig.height = 7}
+# Raw (un-centred) tumour-neighbour density for the population view. `res$K_bio`
+# (and the df kernel columns) are within-image CENTRED for the fit — they carry
+# negatives and are not a usable density axis — so recompute the UN-centred
+# Gaussian kernel with the same args (pace_fit_streaming uses this exact call,
+# then centres). Rows align with `df`, so index by df order (no df_raw matching).
+ker_raw <- pace_neighbour_kernel(as.matrix(df[, c("x", "y")]), df$celltype, cell_types,
+                                 h_bio, h_tech, eps = kernel_radius,
+                                 image = df$imageID, per_image = TRUE)
+raw_tum_density <- ker_raw$K_bio[, "Tumour"]
+macrophage_rows <- which(df$celltype == "Macrophage")
+
+# PACE shrunken slope per response group, read straight from the fit (no re-fit).
+spp1_slopes <- pace_response_slopes(fit, "SPP1", "Macrophage", "Tumour", resp_term,
+                                    ref_name = resp_ref, alt_name = resp_case)
+
+# plot_binned_slope_by_group() lives in scripts/helpers/pace_response_figures.R.
+p.density <- plot_binned_slope_by_group(
+  density        = raw_tum_density[macrophage_rows],
+  expr           = log1p(1e4 * df[["SPP1"]][macrophage_rows] / df$nCount[macrophage_rows]),
+  group          = factor(as.character(df$Responder)[macrophage_rows],
+                          levels = c(resp_case, resp_ref)),
+  slope_by_group = spp1_slopes,
+  group_colours  = setNames(c("#D62728", "#1F77B4"), c(resp_case, resp_ref)),
+  group_labels   = setNames(c("PD (progressive)", "non-PD (SD+PR+CR)"), c(resp_case, resp_ref)),
+  legend_title   = "Response",
+  x_range  = c(0, 65),   # match the published figure (clips a few density > 65 cells)
+  y_max    = 4.8,
+  title    = "SPP1 in macrophages vs tumour-neighbour density, by ICI response",
+  subtitle = sprintf("Solid = binned means +/- SE (data);  dashed = PACE slope (%s %+.3f, %s %+.3f)",
+                     resp_case, spp1_slopes[[resp_case]], resp_ref, spp1_slopes[[resp_ref]]),
+  x_lab = "Tumour-neighbour density (Gaussian kernel)",
+  y_lab = "SPP1 expression (CP10K, log1p)")
+```
+
+# SPP1 exemplar images (tissue maps + within-image scatters)
+
+Two exemplar images — one PD, one non-PD — showing the opposite within-image
+SPP1↔tumour-density relationship. **Top:** tumour-density KDE (white→navy) with
+macrophages coloured by SPP1; **bottom:** within-image scatter (SPP1 vs
+tumour-neighbour density) with an `lm` fit and slope/p/R²/n. Map/scatter/compose
+functions live in `scripts/helpers/pace_response_figures.R`.
+
+```{r spp1-exemplar-maps, fig.width = 11, fig.height = 10}
+# Per-cell table for the spatial figures: coords + type + SPP1 (log1p CP10K) + tumour density.
+cells_all <- data.frame(
+  x = df$x, y = df$y,
+  celltype       = as.character(df$celltype),
+  imageID        = as.character(df$imageID),
+  SPP1_cp10k     = log1p(1e4 * df[["SPP1"]] / df$nCount),
+  tumour_density = raw_tum_density
+)
+ex_pd <- "32156_17"; ex_rsp <- "32157_18"          # one PD + one non-PD exemplar image
+stopifnot(ex_pd %in% cells_all$imageID, ex_rsp %in% cells_all$imageID)
+cells_pd  <- cells_all[cells_all$imageID == ex_pd,  ]
+cells_rsp <- cells_all[cells_all$imageID == ex_rsp, ]
+
+# Shared colour scales across the two maps (SPP1 + tumour-density KDE).
+mac_pd  <- cells_pd[cells_pd$celltype   == "Macrophage", ]
+mac_rsp <- cells_rsp[cells_rsp$celltype == "Macrophage", ]
+spp1_rng <- range(c(mac_pd$SPP1_cp10k, mac_rsp$SPP1_cp10k))
+kde_pd  <- neighbour_density_kde(cells_pd,  "Tumour")
+kde_rsp <- neighbour_density_kde(cells_rsp, "Tumour")
+dens_rng <- range(c(kde_pd$z, kde_rsp$z))
+
+m_pd  <- spatial_density_expr_map(cells_pd,  "Macrophage", "Tumour", "SPP1_cp10k", kde = kde_pd,
+           expr_limits = spp1_rng, density_limits = dens_rng, title = paste0("PD – ", ex_pd),
+           expr_name = "Macrophage SPP1 (log CP10K)", density_name = "Tumour density")
+m_rsp <- spatial_density_expr_map(cells_rsp, "Macrophage", "Tumour", "SPP1_cp10k", kde = kde_rsp,
+           expr_limits = spp1_rng, density_limits = dens_rng, title = paste0("non-PD – ", ex_rsp),
+           expr_name = "Macrophage SPP1 (log CP10K)", density_name = "Tumour density")
+
+# Shared scatter axes.
+xr <- range(c(mac_pd$tumour_density, mac_rsp$tumour_density))
+yr <- range(c(mac_pd$SPP1_cp10k, mac_rsp$SPP1_cp10k))
+s_pd  <- density_expr_scatter(mac_pd$tumour_density,  mac_pd$SPP1_cp10k,  "#d62728",
+           title = paste0(ex_pd, "  (PD)"), x_limits = xr, y_limits = yr,
+           x_lab = "Tumour-neighbour density (Gaussian, h = 30 µm)", y_lab = "Macrophage SPP1 (log CP10K)")
+s_rsp <- density_expr_scatter(mac_rsp$tumour_density, mac_rsp$SPP1_cp10k, "#1f77b4",
+           title = paste0(ex_rsp, "  (non-PD)"), x_limits = xr, y_limits = yr,
+           x_lab = "Tumour-neighbour density (Gaussian, h = 30 µm)", y_lab = "Macrophage SPP1 (log CP10K)")
+
+p_tissue_map <- response_panel_grid(list(m_pd, m_rsp), list(s_pd, s_rsp))
+```
+
+# Donor-level test summary
+
+Triples passing the patient-level test (`q_pair < 0.10`), by pair.
+
+```{r twostage-summary}
+if (!is.null(twostage_disease)) {
+  twostage_disease |>
+    filter(q_pair < 0.10) |>
+    arrange(q_pair) |>
+    group_by(focal, neighbour) |>
+    summarise(n_triples = n(), top_gene = first(gene), min_q = min(q_pair),
+              .groups = "drop") |>
+    arrange(min_q) |>
+    head(15)
+}
+```
+
+```{r}
+pdf("../figures/mel/all_plots.pdf", width = 16, height = 8)
+p.tau
+p.decomp
+p.heat
+p.density
+p_tissue_map
+dev.off()
+```
+
+# Save
+
+Persist this notebook's refit — including the strong/weak Pratt decomposition
+(`mv$pratt_strong_weak`) attached above — to `output_path`. This writes a
+notebook-specific file (`..._notebook.rds`), NOT the canonical fit.
+
+```{r save-fit}
+saveRDS(mv, "../data/simvi_melanoma/canonical_fit.rds")
+```
+
+# Session info
+
+```{r session}
+sessionInfo()
+```

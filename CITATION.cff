@@ -1,0 +1,29 @@
+cff-version: 1.2.0
+message: "If you use this analysis code or the PACE method, please cite the manuscript."
+title: "PACE: manuscript analysis code"
+authors:
+  - family-names: Willie
+    given-names: Elijah
+  - family-names: Rao
+    given-names: Shreya Rajesh
+  - family-names: Ormerod
+    given-names: John
+  - family-names: Patrick
+    given-names: Ellis
+repository-code: "https://github.com/ecool50/PACE_manuscript"
+url: "https://ecool50.github.io/PACE/"
+license: GPL-3.0
+preferred-citation:
+  type: article
+  title: "PACE: proximity-associated changes in expression for imaging-based spatial transcriptomics"
+  authors:
+    - family-names: Willie
+      given-names: Elijah
+    - family-names: Rao
+      given-names: Shreya Rajesh
+    - family-names: Ormerod
+      given-names: John
+    - family-names: Patrick
+      given-names: Ellis
+  year: 2026
+  # doi: REPLACE_WITH_DOI   # fill on acceptance/preprint

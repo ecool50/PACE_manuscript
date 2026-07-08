@@ -1,0 +1,32 @@
+# Data is fetched from Zenodo (fetch_data.R), never committed.
+/data/*
+!/data/.gitkeep
+/pace_mv/data/*
+!/pace_mv/data/.gitkeep
+
+# Downloaded archives / large binaries
+*.zip
+*.tar.gz
+*.h5ad
+*.rds
+
+# Rendered notebook outputs
+*.html
+*_files/
+*_cache/
+.quarto/
+
+# R session / IDE
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+*.Rproj
+
+# Compiled objects
+*.o
+*.so
+*.dll
+
+# OS
+.DS_Store

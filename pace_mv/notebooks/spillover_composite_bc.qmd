@@ -1,0 +1,590 @@
+---
+title: "PACE-MV — Spillover correction comparison (Breast Cancer)"
+author: "Elijah Willie"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: show
+    code-tools: true
+    fig-width: 8
+    fig-height: 5
+    df-print: paged
+    embed-resources: true
+execute:
+  echo: true
+  warning: false
+  message: false
+editor:
+  markdown:
+    wrap: 72
+---
+
+Port of the legacy spillover-correction figure
+(`scripts/_legacy/breast_cancer_pace_10x_spillover.Rmd`, panels A/B/C) onto
+the **current canonical pace_mv pipeline**: per-cell-HC contamination, 8 cell
+types (Mast excluded), NB1 dispersion, uncapped frNN kernels.
+
+We compare four arms = {PACE off / on} × {raw / DenoIST counts}:
+
+| Arm | counts | `contamination` |
+|----|----|----|
+| Uncorrected | raw | `"none"` |
+| PACE | raw | `"percell_hc"` |
+| Denoist | DenoIST-corrected | `"none"` |
+| PACE+Denoist | DenoIST-corrected | `"percell_hc"` |
+
+and read out three panels:
+
+- **A** — the **contamination slope** the model removes: the apparent
+  neighbour→focal slope contributed by `fit$mu_spill` (= ρ·Eᵗᵉᶜʰ) vs the
+  neighbour/focal expression ratio, for the contamination arms. A positive *r*
+  shows the stripped bleed is concentrated in high neighbour/focal genes. (The
+  fitted `fit$U` slopes barely differ across arms — the correction is a *level*
+  effect, not a *slope* effect.)
+- **B** — spillover separation: rank relationships by `|z|`; cumulative
+  non-marker (genuine) vs neighbour-marker (contamination) counts per arm.
+- **C** — spatial cell-state contribution heatmap (**canonical Pratt
+  `pair_pct`**, identical to `decomp_canonical_bc_percell.R`), Denoist vs
+  PACE+Denoist.
+
+# Setup
+
+Same setup as `analysis_bc.qmd` (`scripts/zzz.R` auto-sources `scripts/core`
+then `scripts/helpers`), plus the streaming solver, the `pace_core.R` pipeline,
+and the DenoIST correction helper from the sibling `model_scripts_lite/` tree.
+
+```{r setup}
+rm(list = ls())
+gc()
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(stringr)
+  library(patchwork)
+  library(Matrix)
+  library(SpatialExperiment)
+  library(SingleCellExperiment)
+  library(SummarizedExperiment)
+})
+options(dplyr.summarise.inform = FALSE)
+
+# Run from pace_mv/ wherever this notebook is launched (mirrors analysis_bc.qmd).
+setwd("../../pace_mv")
+
+source("scripts/zzz.R")                                # core + helpers + C++ (auto)
+source("streaming/helpers/pace_mvpql_streaming.R")     # streaming solver
+source("stage0/pace_core.R")                           # pace_fit_streaming(), etc.
+source("../scripts/model_scripts_lite/helpers/denoist_correction.R")  # correct_spe_denoist()
+```
+
+```{r config}
+# ---- canonical model knobs (identical to analysis_bc.qmd) ----
+h_tech        <- 5            # optical-bleed kernel scale (µm)
+h_bio         <- 30           # biological-proximity kernel scale (µm)
+kernel_radius <- 3 * h_bio    # frNN truncation radius (µm)
+min_detection <- 0.05         # gene QC: detected in >= 5% of cells of >= 1 type
+min_neff      <- 30           # drop (focal, neighbour) kernel cols with eff. n < 30
+n_iter        <- 32           # PQL outer iterations
+tau_shrinkage <- "adaptive"
+disp_model    <- "nb1"        # canonical dispersion
+pql_threads   <- 4
+
+# DenoIST EM knobs (the legacy spillover Rmd used radius = 25, lambda_decay = 5).
+denoist_radius       <- 25
+denoist_lambda_decay <- 5
+
+# 8 cell types (Mast excluded: 240 cells, too few for stable spatial slopes).
+cell_types <- c("T_Cell", "Stromal", "Macrophage", "Tumour", "Endothelial",
+                "B_Cell", "Myoepithelial", "Dendritic_Cell")
+
+arm_levels <- c("Uncorrected", "PACE", "Denoist", "PACE+Denoist")
+arm_colour <- c(Uncorrected = "#7E57C2", PACE = "#1E88E5",
+                Denoist = "#E53935", `PACE+Denoist` = "#43A047")
+
+spe_path <- "../../data/spe_10x_nuclei_withMetrics.rds"
+out_dir  <- "figures/spillover"
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+```
+
+# Load SPE, collapse to 8 cell types, drop Mast
+
+```{r load-spe}
+spe <- readRDS(spe_path)
+
+celltype_map <- c(
+  `CRABP2+ Malignant`  = "Tumour",
+  `ECM1+ Malignant`    = "Tumour",
+  `SCGB2A2+ Malignant` = "Tumour",
+  `ACTA2+ Myoepi`      = "Myoepithelial",
+  `KRT15+ Myoepi`      = "Myoepithelial",
+  `Firoblast`          = "Stromal",
+  `VWF+ Endothelial`   = "Endothelial",
+  `STAB2+ Endothelial` = "Endothelial",
+  `CD4 T`              = "T_Cell",
+  `CD8 T`              = "T_Cell",
+  `B Cells`            = "B_Cell",
+  `Plasma`             = "B_Cell",
+  `Macrophage`         = "Macrophage",
+  `CD163+ Macrophage`  = "Macrophage",
+  `IRF7+ DC`           = "Dendritic_Cell",
+  `LAMP3+ DC`          = "Dendritic_Cell",
+  `Mast cells`         = "Mast"
+)
+
+sc_label  <- as.character(colData(spe)$scClassify)
+celltype  <- celltype_map[sc_label]
+keep_cell <- !is.na(celltype) & celltype != "Mast"   # drop unassigned + Mast (low-n)
+spe       <- spe[, keep_cell]
+celltype  <- celltype[keep_cell]
+colData(spe)$celltype <- celltype                    # DenoIST reads this column
+print(table(celltype))
+```
+
+# DenoIST correction
+
+`correct_spe_denoist()` runs the DenoIST Poisson-mixture EM on the raw counts
+and stores the corrected matrix as a second assay (`"corrected"`) on the **same**
+SPE, so the raw and corrected matrices share cells and genes exactly.
+
+```{r denoist}
+spe <- correct_spe_denoist(spe,
+                           celltype_col = "celltype",
+                           radius       = denoist_radius,
+                           lambda_decay = denoist_lambda_decay)
+```
+
+# Assemble shared `Y` (raw + DenoIST) and `df`
+
+Both count matrices pass through the **same** cell and gene QC, so all four arms
+are fit on an identical design (only the counts / contamination vary).
+
+```{r assemble}
+Y_raw     <- t(as.matrix(assay(spe, "counts")))       # cells x genes
+Y_denoist <- t(as.matrix(assay(spe, "corrected")))    # cells x genes (DenoIST EM)
+storage.mode(Y_raw)     <- "integer"
+storage.mode(Y_denoist) <- "integer"                  # EM posteriors rounded to counts
+
+cell_data <- colData(spe)
+cell_xy   <- spatialCoords(spe)
+df <- data.frame(
+  cell_id  = as.character(cell_data$cell_id),
+  x        = cell_xy[, 1],
+  y        = cell_xy[, 2],
+  celltype = factor(celltype, levels = cell_types),
+  slide    = as.character(cell_data$slide),
+  stringsAsFactors = FALSE
+)
+
+# Drop zero-count cells (log offset undefined); base the filter on raw counts.
+df$nCount  <- rowSums(Y_raw)
+has_counts <- df$nCount > 0
+df         <- df[has_counts, ]
+Y_raw      <- Y_raw[has_counts, , drop = FALSE]
+Y_denoist  <- Y_denoist[has_counts, , drop = FALSE]
+df$imageID <- factor(df$slide)
+
+# Gene QC: keep genes detected in >= min_detection of cells of >= 1 cell type.
+celltype_chr  <- as.character(df$celltype)
+cells_by_type <- lapply(cell_types, function(ct) which(celltype_chr == ct))
+max_detection <- vapply(seq_len(ncol(Y_raw)), function(gene_i) {
+  per_type <- vapply(cells_by_type, function(idx) {
+    if (length(idx) == 0L) 0 else mean(Y_raw[idx, gene_i] > 0)
+  }, numeric(1))
+  max(per_type)
+}, numeric(1))
+
+keep_gene <- max_detection >= min_detection
+Y_raw     <- Y_raw[, keep_gene, drop = FALSE]
+Y_denoist <- Y_denoist[, keep_gene, drop = FALSE]
+df$nCount <- rowSums(Y_raw)
+cat(sprintf("%d cells x %d genes; %d slides\n",
+            nrow(Y_raw), ncol(Y_raw), nlevels(df$imageID)))
+```
+
+# Fit the four arms
+
+Each arm is a full `pace_fit_streaming()` call with the exact `analysis_bc.qmd`
+configuration, varying only the counts and the `contamination` flag. This is the
+heavy step (four BC fits); `cache = TRUE` avoids refitting on re-render.
+
+```{r fit-arms, cache = TRUE}
+# Returns the full res (fit for panels A/B; df/Y/X_fixed for panel C's decompose).
+fit_arm <- function(Y_counts, contamination_mode) {
+  pace_fit_streaming(
+    Y = Y_counts, df = df, types = cell_types,
+    celltype_col = "celltype", image_col = "slide", coord_cols = c("x", "y"),
+    h_bio = h_bio, h_tech = h_tech, eps = kernel_radius,
+    contamination     = contamination_mode,   # "none" | "percell_hc"
+    dispersion        = disp_model,
+    drop_sparse_neff  = min_neff,
+    within_image      = TRUE,
+    edge_correct      = TRUE,
+    data_informed_tau = TRUE,
+    n_iter = n_iter, threads = pql_threads, tau_shrinkage = tau_shrinkage,
+    verbose = TRUE
+  )
+}
+
+# Reuse the saved arms if present (the four fits are expensive); else fit + save.
+# Keep only the fields the panels use: fit (panels A/B/C; neighbour kernel lives in
+# fit$re_meta$Z), df, Y, X_fixed (panel C's pace_decompose). Drops K_bio/K_tech.
+# Resolve the sweeps dir whether this chunk runs from pace_mv/ or notebooks/
+# (knitr does not carry the setup chunk's setwd into later chunks).
+arms_dir  <- "data/breast_cancer/sweeps"
+if (!dir.exists(arms_dir)) arms_dir <- "../data/breast_cancer/sweeps"
+arms_path <- file.path(arms_dir, "spillover_arms_bc.rds")
+lean <- function(res) res[c("fit", "df", "Y", "X_fixed")]
+if (file.exists(arms_path)) {
+  ARMS <- readRDS(arms_path)
+} else {
+  res_unc  <- fit_arm(Y_raw,     "none")
+  res_pace <- fit_arm(Y_raw,     "percell_hc")
+  res_den  <- fit_arm(Y_denoist, "none")
+  res_pd   <- fit_arm(Y_denoist, "percell_hc")
+
+  ARMS <- list(Uncorrected = lean(res_unc), PACE = lean(res_pace),
+               Denoist = lean(res_den), `PACE+Denoist` = lean(res_pd))
+  dir.create(arms_dir, recursive = TRUE, showWarnings = FALSE)
+  saveRDS(ARMS, arms_path)
+}
+```
+
+# Shared helpers
+
+```{r helpers}
+# Per-(gene, focal, neighbour) bare neighbour-slope BLUP + z from fit$U / se_U.
+slopes_long <- function(fit) {
+  U  <- fit$U
+  SE <- fit$se_U
+  rn <- rownames(U)
+  gn <- colnames(U)
+  parts    <- strsplit(rn, "::", fixed = TRUE)
+  focal    <- vapply(parts, `[`, "", 1L)
+  term     <- vapply(parts, `[`, "", 2L)
+  ct_set   <- intersect(unique(focal), unique(term))       # the cell-type universe
+  is_slope <- which(term %in% ct_set & focal %in% ct_set & term != focal)
+  do.call(rbind, lapply(is_slope, function(i) data.frame(
+    gene      = gn,
+    focal     = focal[i],
+    neighbour = term[i],
+    slope     = as.numeric(U[i, ]),
+    z         = as.numeric(U[i, ]) / pmax(as.numeric(SE[i, ]), 1e-8),
+    stringsAsFactors = FALSE
+  )))
+}
+
+# One-vs-rest AUC (Mann-Whitney) of a gene's expression for a cell-type label.
+auc_one_vs_rest <- function(x, is_type) {
+  n1 <- sum(is_type)
+  n0 <- sum(!is_type)
+  if (n1 == 0 || n0 == 0) return(NA_real_)
+  r <- rank(x)
+  (sum(r[is_type]) - n1 * (n1 + 1) / 2) / (n1 * n0)
+}
+
+# Per-cell-type mean expression on the CP10k scale (arm-independent reference).
+lib_size  <- pmax(rowSums(Y_raw), 1)
+cp10k     <- sweep(Y_raw, 1, lib_size, "/") * 1e4
+ct_vec    <- as.character(df$celltype)
+ct_levels <- sort(unique(ct_vec))
+ct_mean   <- vapply(ct_levels, function(ct)
+  colMeans(cp10k[ct_vec == ct, , drop = FALSE]), numeric(ncol(cp10k)))
+rownames(ct_mean) <- colnames(Y_raw)                       # genes x cell types
+```
+
+# Panel A — spillover the model removes (contamination slope)
+
+The fitted **random-effect slopes** (`fit$U`) are τ-shrunk and barely differ
+between arms — and in this model the per-cell-HC correction removes contamination
+at the **level**, not the **slope** (a model-free raw-vs-corrected slope contrast
+is flat: r≈0.13 → 0.12). So the informative, shrinkage-free quantity is the
+**contamination slope itself**: the apparent neighbour→focal slope contributed by
+the model's estimated bleed $\rho_i\,E^{\text{tech}}_{ig}$ (`fit$mu_spill`),
+regressed model-free on the neighbour kernel. If it rises with the expression
+ratio, the spillover PACE strips out is concentrated in exactly the high
+neighbour/focal genes. Only the contamination arms (PACE, PACE+Denoist) have a
+$\rho_i E^{\text{tech}}$ term to plot.
+
+```{r panelA, fig.width = 9, fig.height = 4}
+# Marginal OLS slope of each gene's E[cells, g] on the neighbour kernel k.
+marginal_slope <- function(E, k) {
+  kc <- k - mean(k)
+  s  <- sum(kc^2)
+  if (s <= 0) return(rep(NA_real_, ncol(E)))
+  as.numeric(crossprod(kc, sweep(E, 2, colMeans(E), "-")) / s)
+}
+contam_slopes <- function(res, label) {
+  fit <- res$fit
+  mu_spill <- fit$mu_spill                    # dense fit returns it directly
+  if (is.null(mu_spill) && !is.null(fit$mu) && !is.null(fit$technical_offset_mat)) {
+    # streaming fit returns total mu + toff = log1p(mu_spill / mu_bio); recover
+    # the contamination contribution exactly: mu_spill = mu * (1 - exp(-toff)).
+    mu_spill <- fit$mu * (1 - exp(-fit$technical_offset_mat))
+  }
+  if (is.null(mu_spill)) return(NULL)         # arm has no contamination term
+  colnames(mu_spill) <- colnames(res$Y)
+  ctv <- as.character(res$df$celltype)
+  Z   <- fit$re_meta$Z                         # neighbour kernel lives here (focal::neighbour cols)
+  rows <- list()
+  for (fo in cell_types) for (tt in setdiff(cell_types, fo)) {
+    ci  <- which(ctv == fo)
+    col <- paste0(fo, "::", tt)
+    if (length(ci) < 50 || !(col %in% colnames(Z))) next
+    k <- as.numeric(Z[ci, col])                # within-focal kernel for neighbour tt
+    if (stats::var(k) < 1e-12) next            # dropped (n_eff) pairs are all-zero -> skipped
+    rows[[paste(fo, tt)]] <- data.frame(
+      gene      = colnames(res$Y), focal = fo, neighbour = tt,
+      slope     = marginal_slope(mu_spill[ci, , drop = FALSE], k),
+      ratio     = ct_mean[, tt] / pmax(ct_mean[, fo], 1e-6),
+      focal_mean = ct_mean[, fo], arm = label, stringsAsFactors = FALSE)
+  }
+  do.call(rbind, rows)
+}
+panelA_df <- bind_rows(
+  contam_slopes(ARMS[["PACE"]],         "PACE"),
+  contam_slopes(ARMS[["PACE+Denoist"]], "PACE+Denoist")
+) |>
+  filter(is.finite(ratio), is.finite(slope), focal_mean >= 0.05) |>
+  mutate(arm = factor(arm, levels = c("PACE", "PACE+Denoist")))
+
+panelA_r <- panelA_df |>
+  group_by(arm) |>
+  summarise(r = cor(ratio, slope, use = "complete.obs"),
+            x = quantile(ratio, 0.98, na.rm = TRUE), .groups = "drop") |>
+  mutate(label = sprintf("r = %.2f", r))
+
+x_upper <- quantile(panelA_df$ratio, 0.99, na.rm = TRUE)
+pA <- ggplot(panelA_df, aes(ratio, slope)) +
+  geom_point(alpha = 0.18, size = 0.55, colour = "#7E1E1E") +
+  geom_smooth(method = "lm", se = FALSE, colour = "black", linewidth = 0.7) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey60") +
+  geom_text(data = panelA_r, aes(x = x, y = Inf, label = label),
+            hjust = 1, vjust = 1.5, size = 4, inherit.aes = FALSE) +
+  facet_wrap(~arm, nrow = 1) +
+  coord_cartesian(xlim = c(0, x_upper)) +
+  labs(x = "Expression ratio (neighbour / focal)",
+       y = expression("Contamination slope (" * rho[i] * E^{tech} * " on neighbour count)"),
+       title = "A   Spillover the model removes") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"),
+        panel.grid.minor = element_blank())
+pA
+```
+
+# Panel B — spillover separation
+
+Neighbour-cell-type markers are genes with one-vs-rest AUC ≥ 0.70. Ranking
+relationships by `|z|`, a cleaner correction accumulates genuine (non-marker)
+relationships faster than contamination (neighbour-marker) ones.
+
+```{r panelB, fig.width = 13, fig.height = 5.5}
+genes_all <- colnames(Y_raw)
+markers <- bind_rows(lapply(ct_levels, function(ct) {
+  is_ct <- ct_vec == ct
+  auc   <- vapply(genes_all, function(g) auc_one_vs_rest(cp10k[, g], is_ct), numeric(1))
+  data.frame(gene = genes_all, marker_ct = ct, auc = auc)
+})) |>
+  filter(auc >= 0.70)
+marker_set <- split(markers$marker_ct, markers$gene)
+
+panelB_df <- bind_rows(lapply(arm_levels, function(a) {
+  s <- slopes_long(ARMS[[a]]$fit)
+  s <- s[order(-abs(s$z)), ]
+  is_neighbour_marker <- mapply(function(g, nb)
+    !is.null(marker_set[[g]]) && nb %in% marker_set[[g]],
+    s$gene, s$neighbour)
+  data.frame(arm = a,
+             absz          = abs(s$z),
+             marker_rel    = cumsum(is_neighbour_marker),
+             nonmarker_rel = cumsum(!is_neighbour_marker))
+})) |>
+  mutate(arm = factor(arm, levels = arm_levels))
+
+# Bonferroni p < 0.05 cutoff per arm (m = tests per arm). Each point's (x, y) =
+# the contamination (FP) and genuine relationships an arm calls at that threshold.
+cut_at <- function(d, zt) {
+  i <- which(d$absz >= zt)
+  if (!length(i)) data.frame(marker_rel = 0, nonmarker_rel = 0)
+  else d[max(i), c("marker_rel", "nonmarker_rel")]
+}
+cut_pts <- bind_rows(lapply(arm_levels, function(a) {
+  d <- panelB_df[panelB_df$arm == a, ]
+  cut_at(d, qnorm(1 - 0.05 / (2 * nrow(d)))) |> mutate(arm = a)
+})) |>
+  mutate(arm = factor(arm, levels = arm_levels))
+
+b_theme <- theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"),
+        legend.position = c(0.02, 0.98), legend.justification = c(0, 1),
+        legend.background = element_rect(fill = "white", colour = "grey80"),
+        legend.key.size = unit(0.9, "lines"),
+        panel.grid.minor = element_blank())
+
+pB <- ggplot(panelB_df, aes(marker_rel, nonmarker_rel, colour = arm)) +
+  geom_line(linewidth = 1) +
+  geom_segment(data = cut_pts, aes(x = marker_rel, xend = marker_rel,
+                                   y = 0, yend = nonmarker_rel),
+               linetype = "dashed", linewidth = 0.5, alpha = 0.8) +
+  geom_point(data = cut_pts, shape = 17, size = 2.4) +
+  scale_colour_manual(values = arm_colour, name = "Correction") +
+  labs(x = "Neighbour cell type marker relationships",
+       y = "Non marker relationships",
+       title = "B   Spillover separation (full)",
+       subtitle = "dashed line / triangle = Bonferroni p < 0.05 cutoff (per arm)") +
+  b_theme
+
+# Zoom: the arms separate only in the early-ranked region. Crop the contamination
+# (false-positive) axis to at most the first 50 neighbour-marker relationships.
+fp_cap <- min(100, max(panelB_df$marker_rel))
+yz     <- max(panelB_df$nonmarker_rel[panelB_df$marker_rel <= fp_cap]) * 1.04
+pB_zoom <- ggplot(panelB_df, aes(marker_rel, nonmarker_rel, colour = arm)) +
+  geom_line(linewidth = 1) +
+  geom_segment(data = cut_pts, aes(x = marker_rel, xend = marker_rel,
+                                   y = 0, yend = nonmarker_rel),
+               linetype = "dashed", linewidth = 0.5, alpha = 0.8) +
+  geom_point(data = cut_pts, shape = 17, size = 2.4) +
+  scale_colour_manual(values = arm_colour, name = "Correction") +
+  coord_cartesian(xlim = c(0, fp_cap), ylim = c(0, yz), expand = FALSE) +
+  labs(x = "Neighbour cell type marker relationships",
+       y = "Non marker relationships",
+       title = sprintf("B   Spillover separation (first %d FP)", round(fp_cap))) +
+  b_theme + theme(legend.position = "none")
+
+pB | pB_zoom
+
+```
+
+# How many relationships are significant?
+
+Two complementary counts per arm: (1) **PACE's statistical significance** —
+mashr local false sign rate `lfsr < 0.05` over the neighbour-slope relationships;
+(2) **marker-aware empirical FDR** from Panel B's ranking — accept relationships
+down the `|z|` order while the contamination fraction
+`marker_rel / (marker_rel + nonmarker_rel)` stays `<= FDR`, and count what's
+accepted (total and the genuine, non-marker subset).
+
+```{r significance, cache = TRUE}
+# (1) mashr lfsr per arm (neighbour slopes only). pace_shrink works on each arm's fit.
+shr_list <- lapply(arm_levels, function(a) {
+  s <- pace_shrink(ARMS[[a]]$fit, cell_types)
+  s[as.character(s$focal) != as.character(s$neighbour), , drop = FALSE]
+})
+names(shr_list) <- arm_levels
+
+lfsr_counts <- bind_rows(lapply(arm_levels, function(a) {
+  s <- shr_list[[a]]
+  data.frame(arm = a, n_tested = nrow(s),
+             n_sig_lfsr = sum(s$lfsr < 0.05, na.rm = TRUE))
+})) |>
+  mutate(arm = factor(arm, levels = arm_levels))
+
+lfsr_by_pair <- bind_rows(lapply(arm_levels, function(a) {
+  shr_list[[a]] |>
+    group_by(focal, neighbour) |>
+    summarise(n_sig_lfsr = sum(lfsr < 0.05, na.rm = TRUE), .groups = "drop") |>
+    mutate(arm = a)
+}))
+
+# (2) Marker-aware empirical-FDR counts from the ranked curve (panelB_df is in
+# |z| order, so total/genuine are monotone; take the deepest set under each FDR).
+fdr_counts <- panelB_df |>
+  group_by(arm) |>
+  mutate(total = marker_rel + nonmarker_rel,
+         efdr  = marker_rel / pmax(total, 1)) |>
+  summarise(
+    n_sig_fdr05     = max(c(0, total[efdr <= 0.05])),
+    n_genuine_fdr05 = max(c(0, nonmarker_rel[efdr <= 0.05])),
+    n_sig_fdr10     = max(c(0, total[efdr <= 0.10])),
+    n_genuine_fdr10 = max(c(0, nonmarker_rel[efdr <= 0.10])),
+    .groups = "drop") |>
+  mutate(arm = factor(arm, levels = arm_levels)) |>
+  arrange(arm)
+
+write.csv(lfsr_counts, file.path(out_dir, "n_sig_lfsr_bc.csv"), row.names = FALSE)
+write.csv(fdr_counts,  file.path(out_dir, "n_sig_markerFDR_bc.csv"), row.names = FALSE)
+
+lfsr_counts
+fdr_counts
+```
+
+# Panel C — pairwise spatial % (canonical single-frame, normalised Pratt)
+
+The canonical metric (identical to `analysis_bc.qmd` and
+`plot_bc313_composites_all.R` panel C): each cell = the % of the focal type's
+TOTAL variance contributed by spatial interaction with that neighbour — the
+focal's **single-frame** spatial % split across neighbours by the off-diagonal-
+renormalised Pratt share (`foc_sp × V_pair / Σ V_pair`). Single-frame
+decomposition (observed CP10k denominator) computed per arm.
+
+```{r panelC, fig.width = 12, fig.height = 6}
+TYPES <- sort(cell_types)
+normalised_pratt <- function(res, label) {
+  decomp <- pace_decompose(res$fit, res$df, res$Y, cell_types, res$X_fixed)
+  sf <- single_frame_decomp_obs(res$Y, res$df$celltype, rowSums(res$Y),
+                                decomp$gene_focal_4block)
+  foc_sp <- sf |>
+    mutate(ss_sp = `Spatial %` / 100 * denom) |>
+    group_by(focal) |>
+    summarise(spatial_pct = 100 * sum(ss_sp) / sum(denom), .groups = "drop")
+  foc_sp_v <- setNames(foc_sp$spatial_pct, as.character(foc_sp$focal))
+  mv <- list(fit = res$fit, gene_set = colnames(res$Y))
+  pace_pair_variance_pratt(mv, cond_prefix = NULL,
+                           cohort_label = "BC", block_label = "Spatial")$pair_long |>
+    filter(as.character(focal) != as.character(neighbour)) |>
+    group_by(focal) |>
+    mutate(val = foc_sp_v[as.character(focal)] * V_pair_pratt / sum(V_pair_pratt)) |>
+    ungroup() |>
+    transmute(focal = as.character(focal), neighbour = as.character(neighbour),
+              val, model = label)
+}
+panelC_df <- bind_rows(
+  normalised_pratt(ARMS[["Denoist"]],      "Denoist"),
+  normalised_pratt(ARMS[["PACE+Denoist"]], "PACE+Denoist")
+)
+
+# Full focal x neighbour grid per arm (undefined/dropped pairs -> 0; diagonal blank).
+heat <- expand.grid(focal = TYPES, neighbour = TYPES,
+                    model = c("Denoist", "PACE+Denoist"), stringsAsFactors = FALSE) |>
+  filter(focal != neighbour) |>
+  left_join(panelC_df, by = c("focal", "neighbour", "model")) |>
+  mutate(val       = ifelse(is.na(val), 0, val),
+         focal     = factor(focal, levels = TYPES),
+         neighbour = factor(neighbour, levels = rev(TYPES)),
+         model     = factor(model, levels = c("Denoist", "PACE+Denoist")))
+
+pC <- ggplot(heat, aes(focal, neighbour, fill = val)) +
+  geom_tile(colour = "grey92", linewidth = 0.3) +
+  geom_text(aes(label = ifelse(abs(val) < 0.005, "0.00", sprintf("%.2f", val))),
+            size = 2.0, colour = "white") +
+  facet_wrap(~model) +
+  scale_fill_viridis_c(option = "inferno", na.value = "white",
+                       name = "spatial %\nof total") +
+  coord_equal() +
+  labs(x = "Focal", y = "Neighbour",
+       title = "C   Pairwise spatial % (variance, normalised Pratt)") +
+  theme_classic(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.title = element_text(face = "bold", hjust = 0.5))
+pC
+```
+
+# Composite figure
+
+```{r composite, fig.width = 17, fig.height = 9}
+# Composite uses the zoomed Panel B (the full curve collapses onto the diagonal).
+figure <- pA / ((pB_zoom | pC) + plot_layout(widths = c(1, 1.7))) +
+  plot_layout(heights = c(1, 1.05))
+ggsave(file.path(out_dir, "bc_spillover_composite.pdf"),
+       figure, width = 17, height = 9, device = cairo_pdf)
+write.csv(panelA_r[, c("arm", "r")],
+          file.path(out_dir, "bc_panelA_r.csv"), row.names = FALSE)
+figure
+```
+
+```{r panelA-r-table}
+panelA_r[, c("arm", "r")]
+```

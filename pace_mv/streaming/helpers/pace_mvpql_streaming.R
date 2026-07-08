@@ -1,0 +1,739 @@
+## pace_mvpql_streaming.R -- MEMORY-BOUNDED ("streaming") port of
+## fit_pace_mvpql_joint_multi (the dense per-cell-HC contamination solver).
+##
+## GOAL: numerically identical results to fit_pace_mvpql_joint_multi for the
+## canonical per-cell-HC / E^tech path, but with peak memory O(n_cells x
+## chunk_size) instead of O(n_cells x n_genes).
+##
+## KEY IDENTITY that makes this exact:
+##   The dense builder forms a dense n x G ambient matrix
+##     E_tech[i, g] = (1/edge_frac[i]) *
+##                    sum_{j in frNN(i, 3*h_tech), celltype(j)!=celltype(i)}
+##                        exp(-d_ij / h_tech) * Y[j, g].
+##   Define a SPARSE n x n weight matrix W with
+##     W[i, j] = exp(-d_ij / h_tech) / edge_frac[i]
+##   for cross-celltype neighbours j within 3*h_tech (0 otherwise; self
+##   excluded). Then EXACTLY  E_tech[, g] = W %*% Y[, g], and for any gene
+##   chunk  a_chk = W %*% Y[, chunk]  (sparse W times sparse Y-columns ->
+##   dense n x |chunk|). So the full dense E_tech is NEVER materialised; we
+##   stream a_chk per chunk. W is tiny because the E^tech radius is only
+##   3*h_tech (a handful of neighbours per cell).
+##
+## SCOPE of this port (everything else identical math to the dense solver):
+##   - IRLS inner solve only (USE_LAPLACE = FALSE assumed; no TMB path).
+##   - additive_active (per-cell contamination) path is the supported path.
+##   - No per-gene RE block (the canonical BC / Mel per-cell-HC fits have none).
+##     If a per-gene block is detected we stop loudly rather than silently
+##     diverge from the dense solver.
+##
+## All numerics are delegated to the existing helpers (build_random_design_multi,
+## .solve_genes_chunk_multiblock, .alpha_nb1_mle/.alpha_nb2_mle); nothing is
+## reimplemented.
+
+fit_pace_mvpql_streaming <- function(Y, X_fixed, df, re_specs,
+                                     offset_vec       = NULL,
+                                     n_iter           = 16, tol = 5e-3,
+                                     disp_model       = c("nb1", "nb2"),
+                                     tau_shrinkage    = c("hierarchical", "shared",
+                                                          "adaptive", "half_cauchy"),
+                                     BPPARAM          = BiocParallel::SerialParam(),
+                                     chunk_size       = 128L,
+                                     alpha_max_n      = Inf,
+                                     sample_weight    = NULL,
+                                     n_threads        = NULL,
+                                     interior_precision = 1L,
+                                     data_informed_W  = NULL,
+                                     ## ---- Streaming ambient carrier (REPLACES dense ambient_mat) ----
+                                     ## ambient_W: sparse n x n dgCMatrix of E^tech weights (see header).
+                                     ##   a_chk = ambient_W %*% Y[, chunk] reproduces dense E_tech[, chunk].
+                                     ambient_W         = NULL,
+                                     ambient_image_idx = NULL,    ## n-vector, 1-indexed image group per cell
+                                     ambient_n_images  = 0L,
+                                     bleed_percell     = FALSE,
+                                     percell_anchor_mask = NULL,  ## n_types x G (with percell_anchor_idx) OR n x G
+                                     percell_anchor_idx  = NULL,  ## length-n celltype index 1..n_types
+                                     return_mu         = FALSE,   ## when TRUE assemble + return full n x G mu and
+                                                                  ## technical_offset_mat (BC validation only).
+                                     ## ---- Guarded speed approximations (defaults ENABLE the safe mode) ----
+                                     ## alpha_warmup: only re-fit the alpha dispersion MLE for the first
+                                     ##   `alpha_warmup` iterations (and the last iteration); afterwards
+                                     ##   freeze alpha at its warmed-up value. The alpha MLE is ~37% of
+                                     ##   per-iter cost (serial) and converges quickly. Set Inf to always
+                                     ##   update (exact).
+                                     alpha_warmup      = 10L,
+                                     ## early_stop_tol / min_iter: break the IRLS loop once the streamed
+                                     ##   MEAN rel_delta (mean over cell-genes of |Delta eta|/max(|eta|,1e-3))
+                                     ##   falls below early_stop_tol, but never before min_iter iterations.
+                                     ##   The mean is robust to the L-inf max, which a handful of jittering
+                                     ##   cells dominate at large n (the max can oscillate forever while the
+                                     ##   bulk is converged). The L-inf max is still recorded as a diagnostic.
+                                     ##   Set early_stop_tol = 0 to disable.
+                                     early_stop_tol    = 2e-2,
+                                     min_iter          = 12L,
+                                     ## fuse_rho: fold the per-cell rho accumulation INTO the solve pass
+                                     ##   (Pass 1), eliminating the separate second chunk pass. The rho
+                                     ##   update then uses the PRE-solve (iteration t-1) B,U -- a one-step
+                                     ##   lag; same fixed point (B,U are stable at convergence), different
+                                     ##   path. Because the pre-solve eta equals the previous iteration's
+                                     ##   eta, the eta-based rel_delta is unusable, so the fused path uses a
+                                     ##   COEFFICIENT-based convergence metric (mean |dU|/max(|U|,1e-3)).
+                                     ##   ~1 of 3 chunk matmuls + 1 of 2 Y densifies saved per iter.
+                                     fuse_rho          = FALSE,
+                                     verbose           = TRUE) {
+  tau_shrinkage <- match.arg(tau_shrinkage)
+  disp_model    <- match.arg(disp_model)
+
+  ## ---- Y stays SPARSE; never densify the whole matrix. -------------------
+  if (!methods::is(Y, "dgCMatrix")) {
+    Y <- methods::as(methods::as(methods::as(Y, "dMatrix"), "generalMatrix"), "CsparseMatrix")
+  }
+  n   <- nrow(Y); g_n <- ncol(Y); p <- ncol(X_fixed)
+  if (is.null(offset_vec)) offset_vec <- rep(0, n)
+
+  ## ---- This streaming port supports IRLS only (no TMB Laplace). ----------
+  INNER_SOLVE <- tolower(Sys.getenv("R_INNER_SOLVE", "irls"))
+  if (!identical(INNER_SOLVE, "irls"))
+    stop("fit_pace_mvpql_streaming supports only R_INNER_SOLVE=irls (got '",
+         INNER_SOLVE, "'). The Laplace/polish paths are not ported.")
+
+  if (is.null(n_threads))
+    n_threads <- tryCatch(max(1L, BiocParallel::bpworkers(BPPARAM)),
+                          error = function(e) 1L)
+  n_threads <- max(1L, as.integer(n_threads))
+
+  re <- build_random_design_multi(df, re_specs)
+  Z  <- re$Z; q <- ncol(Z)
+  if (verbose) {
+    blk_str <- paste(vapply(re$blocks, function(b)
+      sprintf("%s[%dx%d]", b$group_col, b$K_terms, b$K_groups),
+      character(1)), collapse = "+")
+    cat(sprintf("  [mvpql.streaming] n=%d  g=%d  p_fixed=%d  q_random=%d (= %s)\n",
+                n, g_n, p, q, blk_str))
+  }
+
+  ## ---- No per-gene RE block supported in the streaming port. -------------
+  has_per_gene_block <- any(vapply(re$blocks,
+                                   function(b) isTRUE(b$is_per_gene), logical(1)))
+  if (has_per_gene_block)
+    stop("fit_pace_mvpql_streaming: per-gene RE blocks are not supported by the ",
+         "streaming port (canonical per-cell-HC fits have none).")
+
+  ## ============================================================
+  ## Per-cell contamination model (identifiable form):
+  ## mu_ig = mu_bio_ig + rho_i * a_ig ; a_ig = E^tech ambient = (ambient_W %*% Y)[i,g].
+  ## ============================================================
+  percell_mode    <- isTRUE(bleed_percell)
+  additive_active <- percell_mode &&
+                     !is.null(ambient_W) && ambient_n_images > 0L
+  if (!additive_active)
+    stop("fit_pace_mvpql_streaming: only the per-cell contamination (additive) ",
+         "path is ported. Supply bleed_percell=TRUE, ambient_W, ambient_n_images>0.")
+
+  stopifnot(methods::is(ambient_W, "Matrix"),
+            nrow(ambient_W) == n, ncol(ambient_W) == n,
+            length(ambient_image_idx) == n)
+  add_cell_image <- as.integer(ambient_image_idx)
+  add_rho        <- numeric(n)   ## per-cell contamination loading rho_i
+
+  if (!is.null(percell_anchor_mask)) {
+    if (!is.null(percell_anchor_idx)) {     ## MEM: per-type mask (n_types x G) + length-n index
+      stopifnot(ncol(percell_anchor_mask) == g_n, length(percell_anchor_idx) == n,
+                max(percell_anchor_idx) <= nrow(percell_anchor_mask))
+      percell_anchor_idx <- as.integer(percell_anchor_idx)
+    } else {
+      stopifnot(nrow(percell_anchor_mask) == n, ncol(percell_anchor_mask) == g_n)
+    }
+    storage.mode(percell_anchor_mask) <- "double"
+    if (verbose) cat(sprintf("    [percell_bleed] anchor mask: %s, %.0f anchor entries\n",
+                             if (!is.null(percell_anchor_idx))
+                               sprintf("%d types x %d genes (per-type)", nrow(percell_anchor_mask), g_n)
+                             else "n x G dense",
+                             sum(percell_anchor_mask)))
+  }
+  if (verbose)
+    cat(sprintf("  [percell_bleed] activated: %d images, %d genes; mu = mu_bio + rho_i * a_ig (streaming a_ig)\n",
+                ambient_n_images, g_n))
+
+  ## ---- dispersion family ----
+  disp_env <- Sys.getenv("R_DISP_MODEL", unset = "")
+  disp_nb2 <- if (nzchar(disp_env)) identical(disp_env, "nb2") else identical(disp_model, "nb2")
+  if (disp_nb2 && verbose) cat("  [mvpql.streaming] dispersion family = NB2 (Var=mu(1+alpha*mu))\n")
+
+  ## ---- Per-block tau matrix ----
+  tau_blocks <- lapply(re$blocks, function(b) {
+    matrix(1, b$K_terms, b$K_groups,
+           dimnames = list(b$term_levels, b$group_levels))
+  })
+  build_tau_vec <- function() {
+    out <- numeric(q)
+    for (bi in seq_along(re$blocks)) {
+      blk_i <- re$blocks[[bi]]
+      slice <- as.numeric(t(tau_blocks[[bi]]))
+      out[(blk_i$col_offset + 1L):(blk_i$col_offset + blk_i$n_cols)] <- slice
+    }
+    out
+  }
+  tau_g_array <- matrix(build_tau_vec(), nrow = q, ncol = g_n)
+  rownames(tau_g_array) <- colnames(Z)
+  if (!is.null(colnames(Y))) colnames(tau_g_array) <- colnames(Y)
+
+  ## ---- IRLS state ----
+  ## Small, full-size state ONLY: B (p x G), U (q x G), se_B, se_U, re_var
+  ## (q x G), alpha (G), tau arrays, add_rho (n). NO full n x G mu / mu_bio /
+  ## mu_spill / technical_offset_mat across iterations.
+  alpha      <- rep(1, g_n)
+  prev_alpha <- alpha
+  B    <- matrix(0, p, g_n); U <- matrix(0, q, g_n)
+  re_var <- matrix(0, q, g_n)
+  se_B <- matrix(NA_real_, p, g_n); se_U <- matrix(NA_real_, q, g_n)
+
+  ## Warm-start eta from a count floor (dense uses mu <- pmax(Y, 0.5)). We need
+  ## prev_eta only for the rel_delta convergence diagnostic; compute it on the
+  ## fly per chunk during iter 1 (see below). Initialise prev_eta lazily.
+  prev_eta_set <- FALSE
+  prev_eta     <- NULL   ## becomes an n x G dense matrix ONLY if return_mu (else streamed)
+  ## For the streaming rel_delta we accumulate a scalar max over chunks instead
+  ## of holding the full eta matrix. We keep the previous iteration's eta as a
+  ## small per-chunk-recomputable quantity: store prev_B / prev_U and recompute
+  ## eta_chk = X B + Z U per chunk for both current and previous coefficients.
+  prev_B <- NULL; prev_U <- NULL
+
+  hist <- list(tau_blocks = list(), alpha = list(),
+               rel_delta = numeric(),        ## L-inf max (diagnostic only)
+               rel_delta_mean = numeric())   ## mean over cell-genes (drives early stop)
+  converged <- FALSE
+
+  .em_tau_blocks <- function(U_, V_) {
+    out <- vector("list", length(re$blocks))
+    for (bi in seq_along(re$blocks)) {
+      blk_i <- re$blocks[[bi]]
+      m <- matrix(NA_real_, blk_i$K_terms, blk_i$K_groups,
+                  dimnames = list(blk_i$term_levels, blk_i$group_levels))
+      for (t in seq_len(blk_i$K_terms)) {
+        for (c in seq_len(blk_i$K_groups)) {
+          col <- blk_i$col_offset + (t - 1L) * blk_i$K_groups + c
+          m[t, c] <- pmax(mean(U_[col, ]^2 + V_[col, ], na.rm = TRUE), 1e-6)
+        }
+      }
+      out[[bi]] <- m
+    }
+    out
+  }
+
+  ## ---- SPEED 1: cache a = ambient_W %*% Y ONCE (algebraically a_cache IS the
+  ## full ambient E^tech matrix). The dense E_tech is NEVER materialised on disk
+  ## or held twice; for BC the sparse W times a small dense Y yields a modest
+  ## dense matrix; for WTA the product stays sparse. All call sites below become
+  ## cheap cached column subsets instead of re-running the sparse multiply each
+  ## of the (multiple) passes per iteration.
+  a_cache <- ambient_W %*% Y
+  ## Helper: dense ambient chunk a_chk = (ambient_W %*% Y)[, chunk]  (n x |chunk|),
+  ## served from the precomputed cache (identical to ambient_W %*% Y[, chunk]).
+  .a_chunk <- function(gene_idx_chk) {
+    as.matrix(a_cache[, gene_idx_chk, drop = FALSE])
+  }
+
+  ## ---- SPEED (element-wise): fixed-effect contribution X_fixed %*% coef[,chunk].
+  ## When p == 1 (intercept-only under E^tech) the BLAS matrix-multiply is
+  ## replaced by a row-broadcast: row j is coef[1, chunk[j]] broadcast across
+  ## cells, then each row i scaled by X_fixed[i, 1] (column-major recycling).
+  ## This is ALGEBRAICALLY IDENTICAL to X_fixed %*% coef[, chunk] for ANY p == 1
+  ## (not only X_fixed == 1), and falls back to the dense multiply for p > 1.
+  x1 <- if (p == 1L) as.numeric(X_fixed[, 1L]) else NULL
+  x1_is_unit <- !is.null(x1) && all(x1 == 1)
+  .xb_chunk <- function(coef_mat, gene_idx_chk) {
+    if (p == 1L) {
+      bc <- matrix(coef_mat[1L, gene_idx_chk], nrow = n,
+                   ncol = length(gene_idx_chk), byrow = TRUE)
+      if (x1_is_unit) bc else x1 * bc
+    } else {
+      as.matrix(X_fixed %*% coef_mat[, gene_idx_chk, drop = FALSE])
+    }
+  }
+
+  ## ---- SPEED 2: forked parallel param for the alpha-MLE step ONLY. The alpha
+  ## MLE is embarrassingly parallel over genes and deterministic, so forking
+  ## across n_threads workers is exact. All OTHER bplapply calls keep the passed
+  ## BPPARAM. MulticoreParam forks (Linux + macOS); fall back to BPPARAM serial.
+  alpha_PARAM <- if (n_threads > 1L)
+    BiocParallel::MulticoreParam(workers = n_threads)
+  else BPPARAM
+
+  ## At iteration 1 there are no coefficients yet, so mu_bio is undefined. The
+  ## dense solver seeds mu <- pmax(Y, 0.5) and mu_bio <- mu, mu_spill <- 0. We
+  ## reproduce that EXACTLY in the first IRLS chunk solve by seeding chunk-local
+  ## mu_bio_chk = pmax(Y_chk, 0.5), mu_chk = mu_bio_chk (add_rho is 0 at iter 1
+  ## so mu_spill = 0). For iter > 1 we reconstruct mu_bio_chk / mu_chk from the
+  ## current coefficients + add_rho + a_chk (identical to dense mu_bio / mu).
+  for (it in seq_len(n_iter)) {
+    t_it      <- Sys.time()
+    ## SPEED 4 (guarded): EARLY STOP. Decide at the TOP of the iteration using
+    ## the PREVIOUS iteration's MEAN rel_delta so that the stopping iteration is
+    ## treated as last_iter (runs SEs at precision 0 + final alpha update),
+    ## keeping the output schema identical to a full run. The MEAN (not the L-inf
+    ## max) is the stopping metric: at large n the max is dominated by a few
+    ## jittering cells and never settles, so the max-based stop would never fire
+    ## even when the bulk has converged. We never stop before min_iter.
+    ## early_stop_tol = 0 disables (rel_delta_mean is always >= 0).
+    stop_now <- (it > min_iter && early_stop_tol > 0 &&
+                 length(hist$rel_delta_mean) >= 1L &&
+                 is.finite(hist$rel_delta_mean[it - 1L]) &&
+                 hist$rel_delta_mean[it - 1L] < early_stop_tol)
+    last_iter <- (it == n_iter) || stop_now
+    lam_diag_mat <- 1 / tau_g_array
+
+    ## rho + convergence accumulators (populated by Pass 1 if fuse_rho, else Pass 2)
+    num <- numeric(n); den <- numeric(n)
+    rel_delta <- 0; rd_n <- 0; rd_sum <- 0
+    rd_g01 <- 0; rd_g05 <- 0; rd_g1 <- 0; rd_g10 <- 0
+    RD_DIAG <- nzchar(Sys.getenv("R_RD_DIAG"))
+
+    chk_starts <- seq.int(1L, g_n, by = max(1L, as.integer(chunk_size)))
+    for (cs in chk_starts) {
+      gene_idx_chk   <- cs:min(cs + chunk_size - 1L, g_n)
+      iter_precision <- if (last_iter) 0L else as.integer(interior_precision)
+
+      Y_chk <- as.matrix(Y[, gene_idx_chk, drop = FALSE])
+      a_chk <- .a_chunk(gene_idx_chk)
+
+      if (it == 1L) {
+        ## Seed: dense mu = pmax(Y, 0.5); mu_bio = mu; mu_spill = 0.
+        mu_bio_chk <- pmax(Y_chk, 0.5)
+        mu_chk     <- mu_bio_chk
+      } else {
+        ## Reconstruct mu_bio_chk = exp(eta_chk + offset) and
+        ## mu_chk = mu_bio_chk + add_rho * a_chk  (== dense mu_bio / mu).
+        eta_chk    <- .xb_chunk(B, gene_idx_chk) +
+                      as.matrix(Z %*% U[, gene_idx_chk, drop = FALSE])
+        mu_bio_chk <- pmax(exp(eta_chk + offset_vec), 1e-6)
+        mu_spill_chk <- pmax(a_chk * add_rho, 0)   ## SPEED 3: row-scale (== sweep .,1,.,"*")
+        mu_chk     <- pmax(mu_bio_chk + mu_spill_chk, 1e-6)
+        rm(eta_chk, mu_spill_chk)
+      }
+
+      ## FUSED rho accumulation (Pass 1): mu_chk == mu_tot (mu_bio + previous-rho
+      ## spill). Uses the PRE-solve B,U (one-iter lag vs dense post-solve; same fixed
+      ## point). num/den math identical to the non-fused Pass 2 below.
+      if (fuse_rho) {
+        a_g <- alpha[gene_idx_chk]; nr <- nrow(mu_chk)
+        wcnt_chk <- if (disp_nb2)
+                      1 / (mu_chk * (1 + mu_chk * rep(a_g, each = nr)))
+                    else
+                      (1 / mu_chk) / rep(1 + a_g, each = nr)
+        WA_chk <- wcnt_chk * a_chk
+        if (!is.null(percell_anchor_mask)) {
+          if (!is.null(percell_anchor_idx)) {
+            mask_chk <- percell_anchor_mask[, gene_idx_chk, drop = FALSE]
+            WA_chk   <- WA_chk * mask_chk[percell_anchor_idx, , drop = FALSE]
+          } else {
+            WA_chk <- WA_chk * percell_anchor_mask[, gene_idx_chk, drop = FALSE]
+          }
+        }
+        num <- num + rowSums(WA_chk * Y_chk, na.rm = TRUE)
+        den <- den + rowSums(WA_chk * a_chk, na.rm = TRUE)
+        rm(a_g, wcnt_chk, WA_chk)
+      }
+
+      ## Partial-offset IRLS (additive_active branch, dense lines ~277-283):
+      ## z = eta + (y - mu)/mu_bio ;  w = mu_bio^2 / (mu (1+alpha[*mu])).
+      eta_chk <- log(mu_bio_chk) - offset_vec
+      z_chk   <- eta_chk + (Y_chk - mu_chk) / mu_bio_chk
+      ## SPEED 3: column-scale via rep(v, each = nrow) (column-major: each column j
+      ## is scaled by v[j]) == sweep(M, 2, v, .). a_irls_chk has length |chunk|.
+      a_irls_chk <- alpha[gene_idx_chk]
+      n_chk_rows <- nrow(mu_bio_chk)
+      w_chk   <- if (disp_nb2)
+                   (mu_bio_chk^2) /
+                     (mu_chk * (1 + mu_chk * rep(a_irls_chk, each = n_chk_rows)))
+                 else
+                   ((mu_bio_chk^2) / mu_chk) /
+                     rep(1 + a_irls_chk, each = n_chk_rows)
+      rm(eta_chk, mu_bio_chk, mu_chk)
+      if (!is.null(sample_weight)) w_chk <- w_chk * sample_weight
+      lam_chk <- lam_diag_mat[, gene_idx_chk, drop = FALSE]
+
+      per_gene_chk <- .solve_genes_chunk_multiblock(
+        X_fixed, re$X_terms_list, re$cell_grp_list, re$cells_by_grp_list,
+        w_chk, z_chk, lam_chk, re$blocks,
+        gene_idx = seq_along(gene_idx_chk),
+        n_threads = n_threads,
+        interior_precision = iter_precision,
+        BPPARAM = BPPARAM)
+      ## LOSSLESS NaN GUARD (root-cause fix): the float (interior_precision=1)
+      ## per-gene Cholesky in solve_chunk_full_cpp returns a NaN BLUP column when
+      ## a gene's working-weight system is borderline in single precision (rare,
+      ## run-to-run-variable because float OMP dgemm accumulation order is not
+      ## bit-reproducible). A single NaN BLUP column makes Z%*%U[,g] NaN, which
+      ## NaN-poisons den = rowSums(WA * a) for EVERY cell with nonzero ambient in
+      ## that gene (i.e. nearly all cells) and would silently collapse add_rho to
+      ## its prior panel-wide -- masquerading as "a few degenerate cells". We
+      ## detect any non-finite-BLUP gene in this chunk and RE-SOLVE it in DOUBLE
+      ## precision (interior_precision=0), which is numerically robust (the 1/tau
+      ## ridge makes every per-gene system positive definite). Double re-solve was
+      ## verified NaN-free under stress (lam up to 1e8, alpha up to 50). This keeps
+      ## ALL genes valid -- no gene loses its BLUP -- and is a no-op when the float
+      ## solve already returned finite values (the canonical case).
+      bad_jj <- which(vapply(per_gene_chk, function(r)
+        !all(is.finite(r$beta)) || !all(is.finite(r$u)), logical(1)))
+      if (length(bad_jj) && iter_precision != 0L) {
+        if (verbose)
+          cat(sprintf("    [nan-guard] it=%d chunk@%d: %d gene(s) NaN in float solve -> re-solving in double\n",
+                      it, cs, length(bad_jj)))
+        redo <- .solve_genes_chunk_multiblock(
+          X_fixed, re$X_terms_list, re$cell_grp_list, re$cells_by_grp_list,
+          w_chk[, bad_jj, drop = FALSE], z_chk[, bad_jj, drop = FALSE],
+          lam_chk[, bad_jj, drop = FALSE], re$blocks,
+          gene_idx = seq_along(bad_jj),
+          n_threads = n_threads,
+          interior_precision = 0L,
+          BPPARAM = BPPARAM)
+        for (bi in seq_along(bad_jj)) per_gene_chk[[bad_jj[bi]]] <- redo[[bi]]
+      }
+      for (jj in seq_along(gene_idx_chk)) {
+        gi  <- gene_idx_chk[jj]
+        res <- per_gene_chk[[jj]]
+        B[, gi]      <- res$beta
+        U[, gi]      <- res$u
+        re_var[, gi] <- pmax(res$Ainv_diag[(p + 1):(p + q)], 0)
+        if (last_iter) {
+          se_B[, gi] <- sqrt(pmax(res$Ainv_diag[1:p], 0))
+          se_U[, gi] <- sqrt(pmax(res$Ainv_diag[(p + 1):(p + q)], 0))
+        }
+      }
+      rm(per_gene_chk, z_chk, w_chk, lam_chk, Y_chk, a_chk)
+    }
+
+    ## ----- Per-cell contamination update (streaming rho accumulation) -----
+    ## Dense computes (lines ~333-379), over the FULL n x G matrices:
+    ##   mu_bio = exp(eta + offset); mu_spill = rho_i * a; mu = mu_bio + mu_spill;
+    ##   wcnt   = NB precision at mu_tot = mu_bio + mu_spill (PREVIOUS rho);
+    ##   WA     = wcnt * a  (masked to anchor genes);
+    ##   num    = rowSums(WA * Y); den = rowSums(WA * a);
+    ##   then EB-shrink rho. Because num / den are pure GENE-SUMS, accumulating
+    ##   them chunk-by-chunk is exact (up to float summation order).
+    ##
+    ## NOTE: dense uses mu_spill computed from the rho of the PREVIOUS iteration
+    ## (mu_spill is updated at the END of the loop, after this block uses it).
+    ## We mirror that with mu_spill_chk = add_rho * a_chk using the current
+    ## add_rho (which is still the previous iteration's value at this point).
+    ## SPEED (pass-fusion): fold the rel_delta convergence diagnostic INTO this
+    ## rho-accumulation chunk loop. eta_chk built here for current B,U is reused
+    ## as the rel_delta "new" side (B/U are final for this iteration -- the alpha
+    ## and tau updates do not change them -- so this is identical to recomputing
+    ## eta from current B,U later). Only eta_prev (the denominator side) is
+    ## recomputed: for iter 1 from the dense seed log(pmax(Y,0.5))-offset; for
+    ## iter>1 from prev_B/prev_U. Metric is EXACTLY
+    ##   max(|eta_new - eta_prev| / max(|eta_prev|, 1e-3)).
+    ## num/den + convergence metric come from EITHER the fused Pass 1 above
+    ## (fuse_rho=TRUE) OR this dedicated post-solve second pass (default). The
+    ## accumulators were initialised before Pass 1.
+    if (!fuse_rho) {
+    for (cs in chk_starts) {
+      gene_idx_chk <- cs:min(cs + chunk_size - 1L, g_n)
+      Y_chk <- as.matrix(Y[, gene_idx_chk, drop = FALSE])
+      a_chk <- .a_chunk(gene_idx_chk)
+      eta_chk    <- .xb_chunk(B, gene_idx_chk) +
+                    as.matrix(Z %*% U[, gene_idx_chk, drop = FALSE])
+      ## rel_delta (fused): eta_chk above is the "new" side.
+      prev_eta_chk <- if (!prev_eta_set)
+                        log(pmax(Y_chk, 0.5)) - offset_vec
+                      else
+                        .xb_chunk(prev_B, gene_idx_chk) +
+                        as.matrix(Z %*% prev_U[, gene_idx_chk, drop = FALSE])
+      rd_chunk <- abs(eta_chk - prev_eta_chk) / pmax(abs(prev_eta_chk), 1e-3)
+      rel_delta <- max(rel_delta, max(rd_chunk, na.rm = TRUE))
+      ## mean metric: ALWAYS accumulated (cheap sums) -- drives early stop.
+      fin <- is.finite(rd_chunk)
+      rd_n   <- rd_n   + sum(fin)
+      rd_sum <- rd_sum + sum(rd_chunk[fin])
+      if (RD_DIAG) {       ## tail-fraction counts: diagnostic only
+        rd_g01 <- rd_g01 + sum(rd_chunk[fin] > 0.01)
+        rd_g05 <- rd_g05 + sum(rd_chunk[fin] > 0.05)
+        rd_g1  <- rd_g1  + sum(rd_chunk[fin] > 0.1)
+        rd_g10 <- rd_g10 + sum(rd_chunk[fin] > 1.0)
+      }
+      rm(prev_eta_chk, rd_chunk, fin)
+      mu_bio_chk <- pmax(exp(eta_chk + offset_vec), 1e-6)
+      ## SPEED 3: row-scale a_chk by add_rho (length n = nrow). Column-major
+      ## recycling multiplies each column by add_rho element-wise == sweep(.,1,.,"*").
+      mu_spill_chk <- pmax(a_chk * add_rho, 0)   ## PREVIOUS rho (matches dense)
+      mu_tot_chk <- pmax(mu_bio_chk + mu_spill_chk, 1e-8)
+      a_g <- alpha[gene_idx_chk]
+      ## SPEED 3: column-scale via rep(v, each = nrow) == sweep(M, 2, v, .).
+      n_chk_rows <- nrow(mu_tot_chk)
+      wcnt_chk <- if (disp_nb2)
+                    1 / (mu_tot_chk * (1 + mu_tot_chk * rep(a_g, each = n_chk_rows)))
+                  else
+                    (1 / mu_tot_chk) / rep(1 + a_g, each = n_chk_rows)
+      WA_chk <- wcnt_chk * a_chk
+      if (!is.null(percell_anchor_mask)) {
+        if (!is.null(percell_anchor_idx)) {
+          mask_chk <- percell_anchor_mask[, gene_idx_chk, drop = FALSE]   ## n_types x |chunk|
+          WA_chk   <- WA_chk * mask_chk[percell_anchor_idx, , drop = FALSE]
+        } else {
+          WA_chk <- WA_chk * percell_anchor_mask[, gene_idx_chk, drop = FALSE]
+        }
+      }
+      ## Defense in depth: the NaN-guard above re-solves any non-finite BLUP in
+      ## double, so WA_chk should be all-finite here. Should a gene STILL be
+      ## non-finite (a truly singular gene that even double cannot solve), its
+      ## column must NOT NaN-poison den/num for every cell via rowSums. rowSums
+      ## with na.rm=TRUE drops only that one (cell, gene) contribution, leaving
+      ## every other gene's contribution to each cell's num/den intact (exact for
+      ## the canonical all-finite case).
+      num <- num + rowSums(WA_chk * Y_chk, na.rm = TRUE)
+      den <- den + rowSums(WA_chk * a_chk, na.rm = TRUE)
+      rm(Y_chk, a_chk, eta_chk, mu_bio_chk, mu_spill_chk, mu_tot_chk,
+         wcnt_chk, WA_chk)
+    }
+    } else {
+      ## Fused path: num/den already accumulated in Pass 1. COEFFICIENT-based
+      ## convergence metric -- the eta-based one is unusable here because the
+      ## pre-solve eta equals the previous iteration's eta. rd = |U_new - U_prev|
+      ## / max(|U_prev|, 1e-3) over the random-effect coefficients (they carry the
+      ## cell x neighbour spatial signal; B is intercept-only).
+      if (is.null(prev_U)) {                 ## iter 1: no previous coefficients yet
+        rel_delta <- 1e3; rd_n <- length(U); rd_sum <- 1e3 * length(U)
+      } else {
+        dU   <- abs(U - prev_U) / pmax(abs(prev_U), 1e-3)
+        finU <- is.finite(dU)
+        rel_delta <- max(dU[finU]); rd_n <- sum(finU); rd_sum <- sum(dU[finU])
+        if (RD_DIAG) {
+          rd_g01 <- sum(dU[finU] > 0.01); rd_g05 <- sum(dU[finU] > 0.05)
+          rd_g1  <- sum(dU[finU] > 0.1);  rd_g10 <- sum(dU[finU] > 1.0)
+        }
+        rm(dU, finU)
+      }
+    }
+    ## rel_delta is now fully accumulated (Pass 2 or fused). After iter 1 the dense
+    ## seed is no longer the previous eta (prev_B/prev_U are).
+    prev_eta_set <- TRUE
+    ## SPEED 3: branch-free ratio (ifelse evaluates both arms over the whole
+    ## vector; this only divides where den is non-trivial). Identical result.
+    rho_ratio <- numeric(length(den))
+    ## Guard non-finite den/num (a degenerate cell with extreme mu): such a cell
+    ## carries NO contamination information -> rho=0 there, and it must not NaN-
+    ## poison the precision-weighted prior (den_w drops it). Preserves every other
+    ## cell's result exactly. n_bad is logged so widespread non-finiteness (a real
+    ## divergence, not a stray cell) is visible rather than silently absorbed.
+    finite_cell <- is.finite(den) & is.finite(num)
+    den_ok      <- finite_cell & den > 1e-12
+    rho_ratio[den_ok] <- num[den_ok] / den[den_ok]
+    rho_raw <- pmax(rho_ratio, 0)
+    ## SPEED (element-wise): branch-free den_w (ifelse evaluates/allocates both
+    ## arms over the whole vector). Identical: den where (finite & den>0), else 0.
+    den_pos <- finite_cell & den > 0
+    den_w   <- numeric(length(den))                      # non-finite -> 0 weight
+    den_w[den_pos] <- den[den_pos]
+    n_bad   <- sum(!finite_cell)
+    if (verbose && n_bad > 0L)
+      cat(sprintf("    [percell_bleed] it=%d guarded %d/%d non-finite den/num cells (rho=prior there)\n",
+                  it, n_bad, length(den)))
+    rho_bar <- sum(den_w * rho_raw) / pmax(sum(den_w), 1e-12)
+    den_nz  <- den_w[den_w > 1e-12]
+    if (length(den_nz)) {
+      den0    <- stats::quantile(den_nz, 0.10, names = FALSE)
+      add_rho <- pmax((den_w * rho_raw + den0 * rho_bar) / (den_w + den0), 0)
+    } else {
+      add_rho <- numeric(length(den))
+    }
+    if (verbose && it <= 3) {
+      ## Streamed contam_frac diagnostic (matches dense print).
+      spill_sum <- numeric(n); tot_sum <- numeric(n)
+      for (cs in chk_starts) {
+        gene_idx_chk <- cs:min(cs + chunk_size - 1L, g_n)
+        a_chk <- .a_chunk(gene_idx_chk)
+        eta_chk    <- .xb_chunk(B, gene_idx_chk) +
+                      as.matrix(Z %*% U[, gene_idx_chk, drop = FALSE])
+        mu_bio_chk <- pmax(exp(eta_chk + offset_vec), 1e-6)
+        mu_spill_chk <- pmax(a_chk * add_rho, 0)   ## SPEED 3: row-scale (== sweep .,1,.,"*")
+        mu_chk     <- pmax(mu_bio_chk + mu_spill_chk, 1e-6)
+        spill_sum  <- spill_sum + rowSums(mu_spill_chk)
+        tot_sum    <- tot_sum   + rowSums(mu_chk)
+        rm(a_chk, eta_chk, mu_bio_chk, mu_spill_chk, mu_chk)
+      }
+      fr <- spill_sum / pmax(tot_sum, 1e-9)
+      cat(sprintf("    [percell_bleed] it=%d  rho_i [%.4f,%.4f] med=%.4f  contam_frac med=%.3f q90=%.3f\n",
+                  it, min(add_rho), max(add_rho), stats::median(add_rho),
+                  stats::median(fr), stats::quantile(fr, 0.9)))
+    }
+    rm(num, den)
+
+    ## ----- alpha MLE per gene (streamed mu reconstruction per gene) -----
+    ## Dense computes alpha on the FULL mu = mu_bio + rho_i*a (the NEW add_rho).
+    ## We reconstruct mu[, gi] per chunk and feed each gene column to the MLE.
+    ## SPEED 4 (guarded): the alpha MLE is ~37% of per-iter cost and converges
+    ## quickly, so we only re-fit it for the first `alpha_warmup` iterations (and
+    ## the last iteration); otherwise alpha / prev_alpha are left unchanged.
+    ## alpha_warmup = Inf disables the freeze (always update = exact).
+    update_alpha <- (it <= alpha_warmup) || last_iter
+    if (update_alpha) {
+    alpha_new <- numeric(g_n)
+    for (cs in chk_starts) {
+      gene_idx_chk <- cs:min(cs + chunk_size - 1L, g_n)
+      Y_chk <- as.matrix(Y[, gene_idx_chk, drop = FALSE])
+      a_chk <- .a_chunk(gene_idx_chk)
+      eta_chk    <- .xb_chunk(B, gene_idx_chk) +
+                    as.matrix(Z %*% U[, gene_idx_chk, drop = FALSE])
+      mu_bio_chk <- pmax(exp(eta_chk + offset_vec), 1e-6)
+      mu_spill_chk <- pmax(a_chk * add_rho, 0)   ## SPEED 3: row-scale (== sweep .,1,.,"*")
+      mu_chk     <- pmax(mu_bio_chk + mu_spill_chk, 1e-6)
+      ## SPEED 2: alpha MLE on the FORKED param (deterministic per gene).
+      a_list <- BiocParallel::bplapply(seq_along(gene_idx_chk),
+                  function(jj) {
+                    gi <- gene_idx_chk[jj]
+                    if (disp_nb2) .alpha_nb2_mle(Y_chk[, jj], mu_chk[, jj], max_n = alpha_max_n)
+                    else          .alpha_nb1_mle(Y_chk[, jj], mu_chk[, jj], max_n = alpha_max_n)
+                  }, BPPARAM = alpha_PARAM)
+      alpha_new[gene_idx_chk] <- unlist(a_list, use.names = FALSE)
+      rm(Y_chk, a_chk, eta_chk, mu_bio_chk, mu_spill_chk, mu_chk, a_list)
+    }
+    alpha <- alpha_new
+    alpha[!is.finite(alpha)] <- prev_alpha[!is.finite(alpha)]
+    alpha <- pmin(pmax(alpha, 1e-4), 50)
+    prev_alpha <- alpha
+    } else if (verbose) {
+      cat(sprintf("    [alpha] it=%d > alpha_warmup=%s: alpha FROZEN\n",
+                  it, format(alpha_warmup)))
+    }
+
+    ## ----- tau update (identical to dense) -----
+    tau_blocks <- .em_tau_blocks(U, re_var)
+    if (tau_shrinkage == "hierarchical") {
+      for (bi in seq_along(tau_blocks)) {
+        n_c_b <- vapply(re$cells_by_grp_list[[bi]], length, 0L)
+        tau_blocks[[bi]] <- .shrink_tau_hierarchical(tau_blocks[[bi]], n_c_b)
+      }
+    }
+    if (tau_shrinkage == "shared" || tau_shrinkage == "hierarchical") {
+      tau_g_array[] <- rep(build_tau_vec(), times = g_n)
+    } else {
+      s2_mat <- U^2 + re_var
+      rownames(s2_mat) <- rownames(tau_g_array)
+      for (bi in seq_along(re$blocks)) {
+        blk_i <- re$blocks[[bi]]
+        rng <- (blk_i$col_offset + 1L):(blk_i$col_offset + blk_i$n_cols)
+        s2_b <- s2_mat[rng, , drop = FALSE]
+        d0_min_env <- as.numeric(Sys.getenv("R_D0_MIN", unset = "1"))
+        tau_b_g <- if (tau_shrinkage == "adaptive") {
+          .adaptive_tau_eb(s2_b, blk_i$K_terms, blk_i$K_groups,
+                           gene_names = colnames(Y),
+                           d0_min = d0_min_env,
+                           p_fixed = p)
+        } else {
+          .adaptive_tau_half_cauchy(s2_b, blk_i$K_terms, blk_i$K_groups,
+                                    gene_names = colnames(Y))
+        }
+        tau_g_array[rng, ] <- tau_b_g
+      }
+    }
+    if (!is.null(data_informed_W)) {
+      stopifnot(identical(dim(data_informed_W), dim(tau_g_array)))
+      tau_g_array <- tau_g_array * data_informed_W
+      tau_g_array <- pmax(tau_g_array, 1e-8)
+    }
+
+    ## ----- rel_delta convergence diagnostic -----
+    ## rel_delta was computed (fused) inside the rho-accumulation loop above,
+    ## reusing the current-B,U eta_chk built there. Same exact metric:
+    ##   max(|eta_new - prev_eta| / max(|prev_eta|, 1e-3)). Stash prev_B/prev_U
+    ## for the NEXT iteration's denominator.
+    prev_B <- B; prev_U <- U
+
+    hist$tau_blocks[[it]] <- tau_blocks
+    hist$alpha[[it]]      <- alpha
+    hist$rel_delta[it]    <- rel_delta                               ## L-inf max (diagnostic)
+    hist$rel_delta_mean[it] <- if (rd_n > 0) rd_sum / rd_n else rel_delta  ## mean (early-stop metric)
+    if (RD_DIAG && rd_n > 0)
+      cat(sprintf("  [rd-diag] it=%d  mean=%.4g  max=%.3g  frac>0.01=%.2e  >0.05=%.2e  >0.1=%.2e  >1=%.2e  (N=%.2e)\n",
+                  it, rd_sum / rd_n, rel_delta, rd_g01/rd_n, rd_g05/rd_n, rd_g1/rd_n, rd_g10/rd_n, rd_n))
+    if (verbose) {
+      tau_med <- vapply(tau_blocks, function(m) stats::median(m), numeric(1))
+      cat(sprintf("  [mvpql.streaming] iter %d  rel_delta[mean]=%.3g (max=%.3g)  alpha[med]=%.2f  tau=[%s]  (%.1fs)\n",
+                  it, hist$rel_delta_mean[it], rel_delta, median(alpha),
+                  paste(sprintf("%.3f", tau_med), collapse = ","),
+                  as.numeric(difftime(Sys.time(), t_it, units = "secs"))))
+    }
+    invisible(gc(verbose = FALSE))
+
+    ## SPEED 4 (guarded): break once this iteration was flagged as the early-stop
+    ## last_iter (SEs + final alpha already computed above this iteration).
+    if (stop_now) {
+      converged <- TRUE
+      if (verbose)
+        cat(sprintf("  [mvpql.streaming] EARLY STOP at iter %d (mean rel_delta[%d]=%.3g < %.3g; L-inf max=%.3g)\n",
+                    it, it - 1L, hist$rel_delta_mean[it - 1L], early_stop_tol, hist$rel_delta[it - 1L]))
+      break
+    }
+  }
+
+  rownames(B)    <- colnames(X_fixed); rownames(U)    <- colnames(Z)
+  rownames(se_B) <- colnames(X_fixed); rownames(se_U) <- colnames(Z)
+  if (!is.null(colnames(Y))) {
+    colnames(B) <- colnames(U) <- colnames(se_B) <- colnames(se_U) <- colnames(Y)
+  }
+
+  ## ---- mu / celltype-mean summaries (always streamed; small outputs) ----
+  ## mu_celltype_means: n_celltypes x G colMeans of mu over cells of each focal
+  ## celltype. mu_global_mean: length-G colMeans over all cells.
+  ## When return_mu=TRUE additionally assemble the full n x G mu and
+  ## technical_offset_mat (BC validation / downstream decomposition only).
+  ct_block_idx <- which(vapply(re$blocks, `[[`, character(1), "group_col") == "celltype")
+  ct_levels    <- if (length(ct_block_idx) == 1L) re$blocks[[ct_block_idx]]$group_levels
+                  else sort(unique(as.character(df$celltype)))
+  ct_chr       <- as.character(df$celltype)
+  cells_by_ct  <- lapply(ct_levels, function(c) which(ct_chr == c))
+  names(cells_by_ct) <- ct_levels
+
+  mu_celltype_sum <- matrix(0, length(ct_levels), g_n,
+                            dimnames = list(ct_levels, colnames(Y)))
+  mu_global_sum   <- numeric(g_n)
+  mu_full         <- if (return_mu) matrix(0, n, g_n, dimnames = list(NULL, colnames(Y))) else NULL
+  toff_full       <- if (return_mu) matrix(0, n, g_n, dimnames = list(NULL, colnames(Y))) else NULL
+
+  chk_starts <- seq.int(1L, g_n, by = max(1L, as.integer(chunk_size)))
+  for (cs in chk_starts) {
+    gene_idx_chk <- cs:min(cs + chunk_size - 1L, g_n)
+    a_chk      <- .a_chunk(gene_idx_chk)
+    eta_chk    <- .xb_chunk(B, gene_idx_chk) +
+                  as.matrix(Z %*% U[, gene_idx_chk, drop = FALSE])
+    mu_bio_chk <- pmax(exp(eta_chk + offset_vec), 1e-6)
+    mu_spill_chk <- pmax(a_chk * add_rho, 0)   ## SPEED 3: row-scale (== sweep .,1,.,"*")
+    mu_chk     <- pmax(mu_bio_chk + mu_spill_chk, 1e-6)
+    ## technical_offset_mat = log1p(mu_spill / mu_bio)  (dense line ~372).
+    toff_chk   <- log1p(mu_spill_chk / mu_bio_chk)
+    for (ci in seq_along(ct_levels)) {
+      rr <- cells_by_ct[[ci]]
+      if (length(rr))
+        mu_celltype_sum[ci, gene_idx_chk] <- colSums(mu_chk[rr, , drop = FALSE])
+    }
+    mu_global_sum[gene_idx_chk] <- colSums(mu_chk)
+    if (return_mu) {
+      mu_full[, gene_idx_chk]   <- mu_chk
+      toff_full[, gene_idx_chk] <- toff_chk
+    }
+    rm(a_chk, eta_chk, mu_bio_chk, mu_spill_chk, mu_chk, toff_chk)
+  }
+  n_by_ct <- vapply(cells_by_ct, length, integer(1))
+  mu_celltype_means <- mu_celltype_sum / pmax(n_by_ct, 1L)
+  mu_global_mean    <- mu_global_sum / n
+
+  list(B = B, U = U, se_B = se_B, se_U = se_U,
+       alpha          = alpha,
+       tau_blocks     = tau_blocks,
+       tau_g_array    = tau_g_array,
+       tau_shrinkage  = tau_shrinkage,
+       re_meta        = re,
+       ## Full matrices only when return_mu (BC validation). Otherwise NULL to
+       ## stay memory-bounded; mu summaries below are always available.
+       mu                   = mu_full,
+       technical_offset_mat = toff_full,
+       bleed_offset_mat     = toff_full,
+       mu_celltype_means    = mu_celltype_means,
+       mu_global_mean       = mu_global_mean,
+       ## Per-gene block outputs (always NULL here; no per-gene block supported).
+       bleed_re_U = NULL, bleed_re_se_U = NULL,
+       bleed_re_group_levels = NULL, bleed_re_cell_group = NULL,
+       percell_bleed_rho = add_rho,
+       n_iter = it, converged = converged, history = hist)
+}

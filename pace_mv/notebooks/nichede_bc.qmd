@@ -1,0 +1,601 @@
+---
+title: "niche-DE vs PACE — Breast Cancer (10x Xenium)"
+author: "Elijah Willie"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: show
+    code-tools: true
+    fig-width: 8
+    fig-height: 5
+    df-print: paged
+    embed-resources: true
+execute:
+  echo: true
+  warning: false
+  message: false
+editor:
+  markdown:
+    wrap: 72
+---
+
+**niche-DE** (Mason et al., *Genome Biology* 2024;
+[github](https://github.com/kaishumason/NicheDE)) is the closest published
+comparator to PACE: it tests, for an **index** (focal) cell type, which genes are
+up/down-regulated in the presence of a **niche** (neighbour) cell type. It
+characterises each cell's neighbourhood as an *effective niche* (Gaussian
+kernel-weighted cell-type composition) and regresses expression on it
+(negative-binomial for count data).
+
+This notebook runs niche-DE on the **same** BC Xenium data PACE uses (8 cell
+types, Mast excluded), then matches its `(index, niche)` DE genes to PACE's MCSD
+drivers for the canonical focal←Tumour pairs. The shared metric is **overlap +
+direction concordance** of the called gene sets.
+
+> niche-DE must be installed: `remotes::install_github("kaishumason/NicheDE")`.
+> The `niche_DE()` run on ~126k cells is heavy (minutes–hours); the fit chunks
+> are cached.
+
+# Setup
+
+```{r setup}
+rm(list = ls())
+gc()
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(patchwork)
+  library(ggrepel)
+  library(Matrix)
+  library(SpatialExperiment)
+  library(SingleCellExperiment)
+  library(SummarizedExperiment)
+})
+options(dplyr.summarise.inform = FALSE)
+
+if (!requireNamespace("nicheDE", quietly = TRUE)) {
+  stop("nicheDE not installed. Run: remotes::install_github('kaishumason/NicheDE')")
+}
+library(nicheDE)
+
+# Run from pace_mv/ (mirrors analysis_bc.qmd).
+setwd("../../pace_mv")
+
+spe_path  <- "../../data/spe_10x_nuclei_withMetrics.rds"
+pace_path <- "../../data/breast_cancer/mvpql_percell_hc.rds"   # PACE drivers for comparison
+# Resolve to an ABSOLUTE path so readRDS works regardless of the chunk's working
+# dir (knitr runs each chunk from the document dir, not the setup chunk's setwd).
+for (cand in c(pace_path, file.path("..", pace_path), file.path("pace_mv", pace_path))) {
+  if (file.exists(cand)) { pace_path <- normalizePath(cand); break }
+}
+out_dir   <- "figures/nichede"
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+min_detection <- 0.05
+# niche-DE Gaussian bandwidths (µm), bracketing PACE's biological kernel (h_bio = 30 µm):
+# immediate neighbours / PACE-scale / broader.
+sigma_vec  <- c(15, 30, 60)
+
+cell_types <- c("T_Cell", "Stromal", "Macrophage", "Tumour", "Endothelial",
+                "B_Cell", "Myoepithelial", "Dendritic_Cell")
+```
+
+# Load SPE, collapse to 8 cell types, drop Mast
+
+Identical prep to `analysis_bc.qmd` so niche-DE and PACE see the same cells/genes.
+
+```{r load-spe}
+spe <- readRDS(spe_path)
+
+celltype_map <- c(
+  `CRABP2+ Malignant`  = "Tumour",
+  `ECM1+ Malignant`    = "Tumour",
+  `SCGB2A2+ Malignant` = "Tumour",
+  `ACTA2+ Myoepi`      = "Myoepithelial",
+  `KRT15+ Myoepi`      = "Myoepithelial",
+  `Firoblast`          = "Stromal",
+  `VWF+ Endothelial`   = "Endothelial",
+  `STAB2+ Endothelial` = "Endothelial",
+  `CD4 T`              = "T_Cell",
+  `CD8 T`              = "T_Cell",
+  `B Cells`            = "B_Cell",
+  `Plasma`             = "B_Cell",
+  `Macrophage`         = "Macrophage",
+  `CD163+ Macrophage`  = "Macrophage",
+  `IRF7+ DC`           = "Dendritic_Cell",
+  `LAMP3+ DC`          = "Dendritic_Cell",
+  `Mast cells`         = "Mast"
+)
+
+sc_label  <- as.character(colData(spe)$scClassify)
+celltype  <- celltype_map[sc_label]
+keep_cell <- !is.na(celltype) & celltype != "Mast"   # drop unassigned + Mast
+spe       <- spe[, keep_cell]
+celltype  <- celltype[keep_cell]
+print(table(celltype))
+```
+
+# Build niche-DE inputs
+
+niche-DE needs: a counts matrix (cells × genes), coordinates (cells × 2), a
+**deconvolution matrix** (cells × cell types — one-hot here, since segmentation
+gives each cell a single type), and a **library matrix** (cell-type × gene mean
+profile, via `CreateLibraryMatrix`).
+
+```{r inputs}
+counts <- t(as.matrix(assay(spe, "counts")))          # cells x genes
+storage.mode(counts) <- "integer"
+coord  <- as.matrix(spatialCoords(spe))               # cells x 2 (µm)
+cell_id <- as.character(colData(spe)$cell_id)
+rownames(counts) <- cell_id
+rownames(coord)  <- cell_id
+colnames(coord)  <- c("x", "y")
+
+# Drop zero-count cells + gene QC (>= 5% detection in >= 1 cell type), as in PACE.
+ct_chr  <- as.character(celltype)
+keep_c  <- rowSums(counts) > 0
+counts  <- counts[keep_c, , drop = FALSE]
+coord   <- coord[keep_c, , drop = FALSE]
+ct_chr  <- ct_chr[keep_c]
+
+det <- vapply(cell_types, function(ct) {
+  idx <- which(ct_chr == ct)
+  if (!length(idx)) rep(0, ncol(counts)) else colMeans(counts[idx, , drop = FALSE] > 0)
+}, numeric(ncol(counts)))
+counts <- counts[, apply(det, 1, max) >= min_detection, drop = FALSE]
+
+# One-hot deconvolution matrix (cells x cell types).
+deconv <- vapply(cell_types, function(ct) as.numeric(ct_chr == ct), numeric(nrow(counts)))
+rownames(deconv) <- rownames(counts)
+colnames(deconv) <- cell_types
+
+# Cell-type average expression profiles (cell types x genes). This is what the
+# package helper CreateLibraryMatrix() produces; computed directly here to avoid
+# argument-name ambiguity across nicheDE versions.
+library_mat <- t(vapply(cell_types, function(ct)
+  colMeans(counts[ct_chr == ct, , drop = FALSE]), numeric(ncol(counts))))
+
+cat(sprintf("%d cells x %d genes; deconv %s; library %s\n",
+            nrow(counts), ncol(counts),
+            paste(dim(deconv), collapse = "x"),
+            paste(dim(library_mat), collapse = "x")))
+```
+
+# Run niche-DE
+
+```{r nichede-fit, cache = TRUE}
+# Cache the heavy niche_DE() fit (minutes-hours on ~126k cells) to disk, so
+# re-runs LOAD the saved result instead of recomputing. Delete the file to force
+# a fresh fit. Path derived from the already-absolute pace_path (chunks run from
+# the document dir, so a bare relative path would land in notebooks/).
+nde_cache <- file.path(dirname(dirname(pace_path)), "nichede_bc_nde.rds")
+
+if (file.exists(nde_cache)) {
+  nde <- readRDS(nde_cache)
+  message("loaded cached niche-DE result from ", nde_cache)
+} else {
+  # Positional args, matching the documented tutorial call:
+  #   CreateNicheDEObject(counts, coord, library, deconv, sigma = ...)
+  nde <- CreateNicheDEObject(counts, coord, library_mat, deconv, sigma = sigma_vec)
+
+  # WORKAROUND: CreateNicheDEObject rescales coordinates so min_dist -> 100 using
+  # Rfast::dista(), which returns an all-zeros matrix in this environment (a Rfast
+  # version incompatibility) -> min_dist = NA -> scale = 100/NA = NA -> object@coord
+  # becomes NA and CalculateEffectiveNiche fails ("'from' must be a finite number").
+  # We pass sigma explicitly (in µm), so the min_dist=100 normalisation is unneeded;
+  # restore the original µm coordinates. sigma is then in the same units (µm), so
+  # niche-DE's kernel exp(-(d/sigma)^2) matches PACE's h_bio directly.
+  stopifnot(all(rownames(nde@coord) == rownames(coord)))
+  nde@coord <- coord[rownames(nde@coord), , drop = FALSE]
+
+  # Effective niche (large-scale: batched for ~126k cells).
+  nde <- CalculateEffectiveNicheLargeScale(nde, batch_size = 1000)
+
+  # Niche-DE regression. Int = T -> negative binomial (count data). batch = F
+  # because BC is a single physical section. self_EN = F (drop same-type niche),
+  # matching PACE's exclusion of focal == neighbour slopes.
+  nde <- niche_DE(nde,
+                  num_cores = 4, outfile = "",
+                  C = 150, M = 10, gamma = 0.8,
+                  print = TRUE, Int = TRUE, batch = FALSE, self_EN = FALSE, G = 1)
+
+  saveRDS(nde, nde_cache)
+  message("saved niche-DE result to ", nde_cache)
+}
+```
+
+# Unfiltered niche-DE (matched to PACE's universe)
+
+niche-DE's default gate (`gamma = 0.8`) only tests a gene against a neighbour
+where the gene sits in its **top 20% expressing cell types**, which caps it at
+~50 genes and pre-excludes low-specificity (spillover-prone) relationships. To
+compare it against PACE on the **same universe**, we disable the gate and let it
+score every gene against every neighbour. The object is already built on PACE's
+prefilter (the 275-gene ≥5%-detection panel, Mast dropped), so we only re-run
+`niche_DE()` on it with the gates off:
+
+- `C = 0` — no total-expression cutoff
+- `M = 1` — no minimum-cell cutoff
+- `gamma = 0` — `CT_filter` becomes `min(ref_expr)`, so no cell type is zeroed → every gene is tested against every neighbour
+
+Relationships where a gene is essentially unexpressed in the focal cell still
+return `NA` (a singular negative-binomial variance, a modelling limit — not the
+gate), so coverage lands below the full 275 × 56 but well above the gated ~3080.
+
+```{r nichede-fit-unfiltered, cache = TRUE}
+nde_unf_cache <- file.path(dirname(dirname(pace_path)), "nichede_bc_nde_unfiltered.rds")
+
+if (file.exists(nde_unf_cache)) {
+  nde_unf <- readRDS(nde_unf_cache)
+  message("loaded cached unfiltered niche-DE result from ", nde_unf_cache)
+} else {
+  # Re-runs on the already-built object (counts / effective niche / ref_expr);
+  # only the regression re-fits. Separate cache; the gated fit above is untouched.
+  nde_unf <- niche_DE(nde,
+                      num_cores = 4, outfile = "",
+                      C = 0, M = 1, gamma = 0,
+                      print = TRUE, Int = TRUE, batch = FALSE, self_EN = FALSE, G = 1)
+  saveRDS(nde_unf, nde_unf_cache)
+  message("saved unfiltered niche-DE result to ", nde_unf_cache)
+}
+
+# Coverage vs the gated fit (~3080 estimable interaction relationships).
+n_estimable <- sum(!is.na(nde_unf@niche_DE_pval_pos$interaction_level) &
+                   nde_unf@niche_DE_pval_pos$interaction_level < 1)
+cat(sprintf("unfiltered niche-DE: %d estimable interaction relationships (pos)\n",
+            n_estimable))
+```
+
+# niche-DE genes for the canonical pairs
+
+For each focal←Tumour pair, pull niche-DE's up- and down-regulated genes at the
+interaction level (`test.level = "I"`).
+
+```{r nde-genes}
+bc_pairs <- list(c("Stromal", "Tumour"), c("Macrophage", "Tumour"),
+                 c("Endothelial", "Tumour"), c("Myoepithelial", "Tumour"))
+
+nde_genes <- lapply(bc_pairs, function(p) {
+  up <- tryCatch(get_niche_DE_genes(nde, "I", index = p[1], niche = p[2],
+                                    positive = TRUE,  alpha = 0.05),
+                 error = function(e) NULL)
+  dn <- tryCatch(get_niche_DE_genes(nde, "I", index = p[1], niche = p[2],
+                                    positive = FALSE, alpha = 0.05),
+                 error = function(e) NULL)
+  genes <- function(x) if (is.null(x) || !NROW(x)) character(0) else as.character(x[, 1])
+  list(focal = p[1], neighbour = p[2], up = genes(up), down = genes(dn))
+})
+names(nde_genes) <- vapply(bc_pairs, function(p) paste(p, collapse = "_"), character(1))
+
+for (k in names(nde_genes)) {
+  g <- nde_genes[[k]]
+  cat(sprintf("%-18s  up=%d  down=%d\n", k, length(g$up), length(g$down)))
+}
+```
+
+# Compare to PACE drivers
+
+PACE drivers come from the locked fit (`mvpql_percell_hc.rds`); the canonical
+focal←Tumour pairs do not involve Mast, so the 9-CT PACE fit is comparable to
+this 8-CT niche-DE run. As for the SpatioMark comparison we report **overlap
+coefficient** (shared / smaller set), a **rank correlation** of effect vs
+evidence, **hypergeometric** overlap p, plus direction concordance (Jaccard kept
+for reference).
+
+> niche-DE gives only p-values (no coefficient), so its continuous score is a
+> **signed −log10(q)** (sign = up/down from the one-sided tests). The Spearman is
+> therefore PACE's *effect size* vs niche-DE's *signed significance* — a
+> monotonic-agreement check, not an effect-vs-effect correlation like SpatioMark.
+
+```{r compare}
+mv <- readRDS(pace_path)
+n_universe <- ncol(counts)                    # genes tested (panel)
+
+# PACE: all genes for a pair (threshold-free effect = mash-shrunken slope).
+pace_full <- function(fo, nb) {
+  mv$shrunken_long |>
+    filter(focal == fo, neighbour == nb, term == nb) |>
+    distinct(gene, .keep_all = TRUE) |>
+    transmute(gene, pace_eff = estimate_shrunk, pace_sig = lfsr < 0.05)
+}
+# niche-DE: all genes for a pair; signed -log10(q) (+ve = up with niche), sig at q<0.05.
+nde_full <- function(fo, nb) {
+  getq <- function(pos) {
+    x <- tryCatch(get_niche_DE_genes(nde, "I", index = fo, niche = nb,
+                                     positive = pos, alpha = 1),
+                  error = function(e) NULL)
+    if (is.null(x) || !NROW(x)) data.frame(gene = character(), q = numeric())
+    else data.frame(gene = as.character(x[, 1]), q = as.numeric(x[, 2]))
+  }
+  m <- full_join(rename(getq(TRUE), q_up = q), rename(getq(FALSE), q_dn = q), by = "gene")
+  m$q_up[is.na(m$q_up)] <- 1; m$q_dn[is.na(m$q_dn)] <- 1
+  qmin <- pmin(m$q_up, m$q_dn)
+  data.frame(gene = m$gene,
+             nde_eff = ifelse(m$q_up <= m$q_dn, 1, -1) * (-log10(pmax(qmin, 1e-300))),
+             nde_sig = qmin < 0.05)
+}
+genes_tbl <- bind_rows(lapply(bc_pairs, function(p) {
+  full_join(pace_full(p[1], p[2]), nde_full(p[1], p[2]), by = "gene") |>
+    mutate(pair = sprintf("%s <- %s", p[1], p[2]))
+}))
+
+comparison <- genes_tbl |>
+  group_by(pair) |>
+  summarise(
+    n_PACE     = sum(pace_sig %in% TRUE),
+    n_nicheDE  = sum(nde_sig %in% TRUE),
+    n_shared   = sum((pace_sig %in% TRUE) & (nde_sig %in% TRUE)),
+    dir_concord = { sh <- (pace_sig %in% TRUE) & (nde_sig %in% TRUE)
+                    if (sum(sh)) mean(sign(pace_eff[sh]) == sign(nde_eff[sh])) else NA_real_ },
+    spearman_eff = { co <- !is.na(pace_eff) & !is.na(nde_eff)
+                     if (sum(co) > 2) cor(pace_eff[co], nde_eff[co], method = "spearman") else NA_real_ },
+    .groups = "drop") |>
+  mutate(
+    overlap_coef = n_shared / pmax(pmin(n_PACE, n_nicheDE), 1),
+    jaccard      = n_shared / pmax(n_PACE + n_nicheDE - n_shared, 1),
+    hyper_p      = phyper(n_shared - 1, n_nicheDE, n_universe - n_nicheDE, n_PACE, lower.tail = FALSE),
+    across(c(dir_concord, spearman_eff, overlap_coef, jaccard), ~ round(.x, 3)),
+    hyper_p      = signif(hyper_p, 2)
+  ) |>
+  relocate(pair, n_PACE, n_nicheDE, n_shared,
+           overlap_coef, spearman_eff, dir_concord, jaccard, hyper_p)
+comparison
+```
+
+```{r save-comparison}
+write.csv(comparison, file.path(out_dir, "nichede_vs_pace_bc.csv"), row.names = FALSE)
+write.csv(genes_tbl,  file.path(out_dir, "nichede_vs_pace_genes_bc.csv"), row.names = FALSE)
+```
+
+# Visualisation
+
+```{r compare-viz, fig.width = 11, fig.height = 9}
+# (1) shared / method-only counts per pair
+bar_dat <- comparison |>
+  transmute(pair,
+            `niche-DE only` = n_nicheDE - n_shared,
+            `shared`        = n_shared,
+            `PACE only`     = n_PACE - n_shared) |>
+  pivot_longer(-pair, names_to = "set", values_to = "n") |>
+  mutate(set = factor(set, levels = c("niche-DE only", "shared", "PACE only")))
+p_bar <- ggplot(bar_dat, aes(n, pair, fill = set)) +
+  geom_col() +
+  scale_fill_manual(values = c("niche-DE only" = "#F28E2B", shared = "#76B7B2",
+                               "PACE only" = "#4E79A7"), name = NULL) +
+  labs(x = "significant genes", y = NULL,
+       title = "A   Significant drivers per pair (PACE vs niche-DE)") +
+  theme_bw(base_size = 11) + theme(legend.position = "top")
+
+# (2) PACE effect vs niche-DE signed significance, shared-significant genes highlighted.
+# Hide saturated |−log10 q| > 50 (display only; metrics/rho computed on full set).
+sc <- genes_tbl |>
+  filter(!is.na(pace_eff), !is.na(nde_eff), abs(nde_eff) <= 50) |>
+  mutate(category = ifelse((pace_sig %in% TRUE) & (nde_sig %in% TRUE), "both significant",
+                    ifelse((pace_sig %in% TRUE) | (nde_sig %in% TRUE), "one method", "neither")))
+rho_lab <- comparison |> transmute(pair, label = sprintf("rho = %.2f", spearman_eff))
+p_scatter <- ggplot(sc, aes(pace_eff, nde_eff)) +
+  geom_hline(yintercept = 0, colour = "grey85") +
+  geom_vline(xintercept = 0, colour = "grey85") +
+  geom_point(aes(colour = category), alpha = 0.5, size = 1) +
+  geom_text(data = rho_lab, aes(x = -Inf, y = Inf, label = label),
+            hjust = -0.12, vjust = 1.6, inherit.aes = FALSE, size = 3.4) +
+  facet_wrap(~ pair, scales = "free") +
+  scale_colour_manual(values = c("both significant" = "#4E79A7",
+                                 "one method" = "#F28E2B", "neither" = "grey75"), name = NULL) +
+  labs(x = "PACE shrunken slope",
+       y = "niche-DE signed −log10(q)  (+ve = up with niche; saturated |·|>50 hidden)",
+       title = "B   PACE effect vs niche-DE signed significance (Spearman over co-tested genes)") +
+  theme_bw(base_size = 11) + theme(legend.position = "top")
+
+fig <- p_bar / p_scatter + plot_layout(heights = c(1, 2.4))
+ggsave(file.path(out_dir, "nichede_vs_pace_viz_bc.pdf"), fig,
+       width = 11, height = 9, device = cairo_pdf)
+# fig
+```
+
+# Top-gene rankings — do the headline drivers agree?
+
+PACE ranks genes by **MCSD** (`b²·spec²·focal_mean`); niche-DE has no such score,
+so we rank it by **significance** (smallest q first). Below: each pair's top-N by
+each method side by side (shared genes marked `*`), and a rank-rank plot for the
+genes both methods call significant.
+
+```{r top-genes}
+N_top <- 15
+
+pace_rank_tbl <- function(fo, nb) {
+  s <- mv$mcsd_canonical[[paste(fo, nb, sep = "_")]]$scores
+  if (is.null(s) || !nrow(s)) return(data.frame(gene = character(), pace_rank = integer()))
+  s |> arrange(rank) |> transmute(gene, pace_rank = row_number())   # MCSD order
+}
+nde_rank_tbl <- function(fo, nb) {
+  nde_full(fo, nb) |> filter(nde_sig) |>
+    arrange(desc(abs(nde_eff))) |> mutate(nde_rank = row_number()) |>
+    transmute(gene, nde_rank)                                        # significance order
+}
+rank_tbl <- bind_rows(lapply(bc_pairs, function(p) {
+  full_join(pace_rank_tbl(p[1], p[2]), nde_rank_tbl(p[1], p[2]), by = "gene") |>
+    mutate(pair = sprintf("%s <- %s", p[1], p[2]))
+}))
+
+# Side-by-side top-N (shared genes flagged with *) + a one-line top-N overlap count.
+pad <- function(x, n) c(as.character(x), rep("", n))[seq_len(n)]
+top_side <- bind_rows(lapply(bc_pairs, function(p) {
+  pr <- sprintf("%s <- %s", p[1], p[2]); d <- filter(rank_tbl, pair == pr)
+  pt <- d |> filter(!is.na(pace_rank)) |> arrange(pace_rank) |> head(N_top)
+  nt <- d |> filter(!is.na(nde_rank))  |> arrange(nde_rank)  |> head(N_top)
+  shared <- intersect(pt$gene, nt$gene)
+  star <- function(g) ifelse(g %in% shared & nzchar(g), paste0(g, " *"), g)
+  cat(sprintf("%-20s top-%d overlap: %d / %d\n", pr, N_top, length(shared), N_top))
+  data.frame(pair = pr, rank = seq_len(N_top),
+             PACE_top    = star(pad(pt$gene, N_top)),
+             nicheDE_top = star(pad(nt$gene, N_top)),
+             stringsAsFactors = FALSE)
+}))
+top_side
+```
+
+```{r rank-scatter, fig.width = 11, fig.height = 8}
+rr <- rank_tbl |> filter(!is.na(pace_rank), !is.na(nde_rank))   # genes ranked by both
+rho_lab <- rr |> group_by(pair) |>
+  summarise(label = sprintf("rank rho = %.2f",
+                            cor(pace_rank, nde_rank, method = "spearman")), .groups = "drop")
+ggplot(rr, aes(pace_rank, nde_rank)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey70") +
+  geom_point(colour = "#4E79A7", alpha = 0.6, size = 1.4) +
+  geom_text(data = filter(rr, pace_rank <= 10 | nde_rank <= 10),
+            aes(label = gene), size = 2.5, vjust = -0.5, check_overlap = TRUE) +
+  geom_text(data = rho_lab, aes(x = Inf, y = -Inf, label = label),
+            hjust = 1.1, vjust = -0.6, inherit.aes = FALSE, size = 3.3) +
+  facet_wrap(~ pair, scales = "free") +
+  labs(x = "PACE rank (MCSD)", y = "niche-DE rank (significance)",
+       title = "Top-gene rank agreement (genes significant in both; diagonal = same rank)") +
+  theme_bw(base_size = 11)
+```
+
+# Selection plane — why the rankings diverge (and why it favours PACE)
+
+The rank disagreement above is driven by **specificity**, a *data-derived* gene
+property (low spec = the gene is expressed mainly in **other** cell types, so a
+count in the focal type is contamination-prone). Plotting niche-DE's own ranking
+axis (significance, −log10 q) against specificity shows the mechanism: niche-DE
+elevates significant **low-specificity** genes (top-left = contamination traps,
+e.g. the fibroblast/ECM genes LUM, POSTN appearing in myoepithelial cells), while
+PACE's specificity weighting pushes its top drivers to the **right** (specific).
+Both displayed axes are external to PACE's MCSD, so this is not circular.
+
+```{r selection-plane, fig.width = 11, fig.height = 9}
+N_top <- 15
+
+# PACE specificity + MCSD rank for all PACE-significant genes, per pair.
+pace_spec_tbl <- function(fo, nb) {
+  s <- mv$mcsd_canonical[[paste(fo, nb, sep = "_")]]$scores
+  if (is.null(s) || !nrow(s)) return(data.frame())
+  s |> arrange(rank) |> transmute(gene, spec, pace_rank = row_number())
+}
+
+plane <- bind_rows(lapply(bc_pairs, function(p) {
+  ps <- pace_spec_tbl(p[1], p[2])
+  if (!nrow(ps)) return(data.frame())
+  nd <- nde_full(p[1], p[2]) |>
+    filter(nde_sig) |>
+    mutate(nde_sig_score = abs(nde_eff)) |>
+    arrange(desc(nde_sig_score)) |>
+    mutate(nde_rank = row_number()) |>
+    select(gene, nde_sig_score, nde_rank)
+  inner_join(ps, nd, by = "gene") |>            # genes called by BOTH -> it's a ranking question
+    mutate(pair = sprintf("%s <- %s", p[1], p[2]),
+           category = case_when(
+             pace_rank <= N_top & nde_rank <= N_top ~ "both top",
+             nde_rank  <= N_top                     ~ "niche-DE top only",
+             pace_rank <= N_top                     ~ "PACE top only",
+             TRUE                                   ~ "neither top"))
+}))
+
+# DISPLAY filter: niche-DE combines 3 sigmas via the Cauchy rule (combined q can
+# saturate to ~0) and n=126k inflates significance, so -log10 q > 50 is not an
+# interpretable magnitude. Hide those points (plots only; the comparison metrics
+# above are computed on the full set and are unchanged).
+sig_cap    <- 50
+plane_show <- filter(plane, nde_sig_score <= sig_cap)
+cat(sprintf("selection plane: hiding %d / %d points with -log10 q > %d (saturated)\n",
+            sum(plane$nde_sig_score > sig_cap), nrow(plane), sig_cap))
+
+p_plane <- ggplot(plane_show, aes(spec, nde_sig_score)) +
+  geom_point(aes(colour = category), alpha = 0.65, size = 1.7) +
+  geom_text_repel(data = filter(plane_show, pace_rank <= 5),
+                  aes(label = gene), size = 2.6, max.overlaps = Inf,
+                  min.segment.length = 0, box.padding = 0.4, seed = 1) +
+  facet_wrap(~ pair, scales = "free_y") +
+  scale_colour_manual(values = c("both top" = "#76B7B2", "niche-DE top only" = "#F28E2B",
+                                 "PACE top only" = "#4E79A7", "neither top" = "grey80"),
+                      name = NULL) +
+  labs(x = "PACE specificity  (data-derived; low = expressed mainly in other cell types)",
+       y = "niche-DE significance  (−log10 q; saturated > 50 hidden)",
+       title = "Selection plane: significance vs specificity",
+       subtitle = "Co-significant genes (−log10 q > 50 hidden); niche-DE-top-only cluster sits at low specificity") +
+  theme_bw(base_size = 11) + theme(legend.position = "top")
+
+ggsave(file.path(out_dir, "nichede_selection_plane_bc.pdf"), p_plane,
+       width = 11, height = 9, device = cairo_pdf)
+# p_plane
+```
+
+# Spillover illustration — expression in the neighbour cell type
+
+Same view as the SpatioMark comparison, with niche-DE in the comparator role: mean
+log1p(CP10k) expression of each gene in the **focal** cells vs the **neighbour
+(Tumour)** cells. If niche-DE's significant top genes (orange, "niche-DE top only")
+sit **above the diagonal** — higher in Tumour than the focal — then niche-DE's
+"focal change near Tumour" is direct evidence of **spillover**, which PACE's
+specificity weighting demotes.
+
+```{r spillover-expr, fig.width = 11, fig.height = 9}
+N_top <- 15
+
+# Model-free spillover axis: mean log1p(CP10k) expression per gene per cell type.
+lib_size   <- pmax(rowSums(counts), 1)
+expr_log   <- log1p(sweep(counts, 1, lib_size, "/") * 1e4)   # cells x genes
+expr_by_ct <- vapply(cell_types, function(ct) {
+  idx <- which(ct_chr == ct)
+  if (!length(idx)) rep(NA_real_, ncol(counts)) else colMeans(expr_log[idx, , drop = FALSE])
+}, numeric(ncol(counts)))
+rownames(expr_by_ct) <- colnames(counts)
+
+# niche-DE significant genes for a pair, ranked by significance.
+nde_sig_tbl <- function(fo, nb) {
+  nde_full(fo, nb) |> filter(nde_sig) |>
+    mutate(nde_score = abs(nde_eff)) |>
+    arrange(desc(nde_score)) |> mutate(nde_rank = row_number()) |>
+    transmute(gene, nde_score, nde_rank)
+}
+
+spill <- bind_rows(lapply(bc_pairs, function(p) {
+  ps <- pace_spec_tbl(p[1], p[2]); if (!nrow(ps)) return(data.frame())
+  nd <- nde_sig_tbl(p[1], p[2])
+  inner_join(ps, nd, by = "gene") |>
+    mutate(pair       = sprintf("%s <- %s", p[1], p[2]),
+           focal_expr = expr_by_ct[cbind(gene, p[1])],
+           nbr_expr   = expr_by_ct[cbind(gene, p[2])],
+           category   = case_when(
+             pace_rank <= N_top & nde_rank <= N_top ~ "both top",
+             nde_rank  <= N_top                     ~ "niche-DE top only",
+             pace_rank <= N_top                     ~ "PACE top only",
+             TRUE                                   ~ "neither top"))
+}))
+
+p_spill <- ggplot(spill, aes(focal_expr, nbr_expr)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey70") +
+  geom_point(aes(colour = category), alpha = 0.5, size = 1.3) +
+  # Label top genes only where expression is meaningful (skip the noisy ~0,0 pile).
+  geom_text_repel(data = filter(spill, category != "neither top",
+                                pmax(focal_expr, nbr_expr, na.rm = TRUE) > 0.5),
+                  aes(label = gene, colour = category), size = 2.3, max.overlaps = Inf,
+                  min.segment.length = 0, box.padding = 0.35, seed = 1, show.legend = FALSE) +
+  facet_wrap(~ pair, scales = "free") +
+  scale_colour_manual(values = c("both top" = "#00A087", "niche-DE top only" = "#E64B35",
+                                 "PACE top only" = "#3C5488", "neither top" = "grey80"),
+                      name = NULL) +   # ggsci NPG palette
+  labs(x = "mean expression in focal cells  (log1p CP10k)",
+       y = "mean expression in neighbour (Tumour) cells  (log1p CP10k)",
+       title = "Spillover illustration: are niche-DE-top genes expressed more in the neighbour than the focal?",
+       subtitle = "Above the diagonal = higher in Tumour than focal (spillover-prone); red = niche-DE top only") +
+  theme_bw(base_size = 11) + theme(legend.position = "top")
+
+# ggsave(file.path(out_dir, "nichede_spillover_expression_bc.pdf"), p_spill,
+#        width = 11, height = 9, device = cairo_pdf)
+p_spill
+```
+
+# Write the PDFs to file
+```{r}
+pdf("figures/nichede/nicheDE_all.pdf", width = 12, height = 10)
+fig
+p_plane
+p_spill
+dev.off()
+```
