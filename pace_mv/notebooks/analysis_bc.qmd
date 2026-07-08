@@ -1,715 +1,168 @@
 ---
-title: "PACE-MV — Breast Cancer (10x Xenium) analysis"
+title: "PACE breast cancer analysis (Figure 2)"
 author: "Elijah Willie"
-date: today
 format:
   html:
     toc: true
-    toc-depth: 3
-    code-fold: show
-    code-tools: true
-    fig-width: 8
-    fig-height: 5
-    df-print: paged
     embed-resources: true
 execute:
-  echo: true
   warning: false
   message: false
-editor:
-  markdown:
-    wrap: 72
 ---
 
-Janesick 2023 breast cancer Xenium, analysed end-to-end with the
-**current canonical PACE-MV pipeline** (per-cell-HC contamination model,
-NB1 dispersion, uncapped frNN kernels). The starting point is a
-`SpatialExperiment` (`spe_10x_nuclei_withMetrics.rds`) carrying
-scClassify cell-type labels.
+This notebook reproduces the breast cancer analysis and Figure 2 of the PACE
+manuscript **using the [PACE package](https://github.com/ecool50/PACE)**. The
+method (neighbour kernels, per-cell contamination correction, NB1 PQL fit, mashr
+shrinkage, variance decomposition, driver scores) and the standard figures come
+from the package; only the bespoke spatial ROI-inset composition is a local
+helper. Rendered from the repository root:
 
-This is a **single physical section** (the `slide` column = FOV tiles /
-CV folds, not biological replicates), so there is no disease contrast:
-the inferential target is `V_spatial` — the spatial proximity slope
-itself — not a condition × spatial interaction.
-
-This notebook reproduces the locked fit
-`data/breast_cancer/sweeps/mvpql_percell_hc.rds`. It refits from the SPE
-rather than loading the cached bundle, so it is self-contained; the
-numbers reproduce the canonical fit closely (the locked fit reads the
-pre-built `Y_df_for_mcsd.rds` gene bundle, so tiny gene-set differences
-are possible).
-
-Modelled on the legacy `breast_cancer_pace_10x.Rmd` analysis arc,
-modernised to the per-cell-HC model and the current `scripts/` tree.
+```bash
+quarto render pace_mv/notebooks/analysis_bc.qmd
+```
 
 # Setup
 
-Load the package code (`scripts/zzz.R` auto-sources `scripts/core/` then
-`scripts/helpers/`) and set the canonical model knobs. These are the
-same constants the canonical builder uses; none are tuned per cohort
-except `disp_model = "nb1"` (canonical) and the frNN kernel.
-
-| Constant | Meaning |
-|----|----|
-| `h_tech = 5 µm` | exponential kernel scale (optical bleed) |
-| `h_bio = 30 µm` | Gaussian kernel scale (biological proximity) |
-| `kernel_radius = 3·h_bio = 90 µm` | frNN radius (uncapped neighbour sum) |
-| `min_detection = 0.05` | gene QC: detected in ≥5% of ≥1 cell type |
-| `min_neff = 30` | drop (focal,nb) kernel cols with effective n \< 30 |
-| `n_iter = 32` | PQL outer iterations |
-| `disp_model = "nb1"` | NB1 variance `μ(1+α)` (canonical) |
-
 ```{r setup}
-rm(list = ls())
-gc()
+library(PACE)
+library(SpatialExperiment)
+library(SummarizedExperiment)
+library(Matrix)
+library(dplyr)
+library(ggplot2)
 
-suppressPackageStartupMessages({
-  # tidyverse + plotting
-  library(dplyr)
-  library(tibble)
-  library(tidyr)
-  library(ggplot2)
-  library(stringr)
-  library(forcats)
-  library(patchwork)
-  # matrices, parallelism, neighbour search
-  library(Matrix)
-  library(BiocParallel)
-  library(FNN)
-  library(dbscan)
-  # model + shrinkage
-  library(glmmTMB)
-  library(mashr)
-  # data containers
-  library(SpatialExperiment)
-  library(SingleCellExperiment)
-  library(SummarizedExperiment)
-})
-options(dplyr.summarise.inform = FALSE)
+# Bespoke ROI-inset figure (Figure 2e) -- not part of the PACE package.
+source("../helpers/compose_inset_figure.R")
 
-# Run from pace_mv/ wherever this notebook is launched: here::here() finds the
-# repo root (via lateral_spillover.Rproj), then we descend into pace_mv/.
-setwd("../../pace_mv")
-
-# scripts/zzz.R auto-sources scripts/core + scripts/helpers and compiles the C++;
-# then the streaming solver and the pipeline.
-source("scripts/zzz.R")                              # auto-loads scripts/ (core + helpers + C++)
-source("scripts/core/06a-plots-decomp.R")            # decomp plot fns: zzz's numbered loader skips 06a/b/c/d
-source("streaming/helpers/pace_mvpql_streaming.R")   # streaming solver (lives outside scripts/helpers/)
-source("stage0/pace_core.R")                         # the pipeline functions
+spe_path <- "../../data/spe_10x_nuclei_withMetrics.rds"   # fetched by fetch_data.R
 ```
 
-```{r}
-# ---- canonical model knobs (BC per-cell-HC, NB1, frNN) ----
-h_tech        <- 5            # optical-bleed kernel scale (µm)
-h_bio         <- 30           # biological-proximity kernel scale (µm)
-kernel_radius <- 3 * h_bio    # frNN truncation radius (µm); kernels < 1e-3 beyond
-min_detection <- 0.05         # gene QC: detected in >= 5% of cells of >= 1 type
-min_neff      <- 30           # drop (focal, neighbour) kernel cols with eff. n < 30
-n_iter        <- 32           # PQL outer iterations
-tau_shrinkage <- "adaptive"   # empirical-Bayes pooling of variance components
-disp_model    <- "nb1"        # NB1 dispersion: Var = mu (1 + alpha) 
-pql_threads   <- 4
+# Load and prepare the section
 
-# The 8 cell types PACE fits against (sub-states collapsed; see next section).
-# Mast is EXCLUDED: only 240 cells (0.2%) -> too few to estimate spatial slopes,
-# and as a rare neighbour it produced unstable, low-n flagship artifacts
-# (e.g. Tumour<-Mast, n_eff ~43 vs ~300 for real pairs). Dropped at the QC filter.
-cell_types <- c("T_Cell", "Stromal", "Macrophage", "Tumour", "Endothelial",
-                "B_Cell", "Myoepithelial", "Dendritic_Cell")
+Collapse the 17 scClassify sub-states into the eight modelled cell types, drop
+the rare mast population, and keep genes detected in at least 5% of cells of some
+cell type -- exactly the manuscript filter (126,192 cells x 275 genes).
 
-# Inputs / outputs.
-spe_path    <- "../../data/spe_10x_nuclei_withMetrics.rds"   # raw SPE (shared data lake)
-output_path <- "../../data/breast_cancer/sweeps/mvpql_percell_hc_notebook.rds"
-```
-
-
-The model + reporting come from `stage0/pace_core.R` (`pace_fit_streaming()`,
-`pace_shrink()`, `pace_decompose()`, `pace_top_drivers()`). The figure helpers
-(`density_bin_boxplot()`, `top_gene()`, `fp_curve()`, `compose_inset_figure()`)
-live in `scripts/helpers/` and are auto-sourced in the setup chunk.
-
-# Load SPE and map to the 8-cell-type scheme
-
-The 17 fine-grained scClassify labels carry sub-state detail PACE does
-not need (three malignant states pool into `Tumour`, two myoepithelial
-into `Myoepithelial`, etc.). Pooling keeps each focal random-slope block
-well-powered. `unassigned` cells are dropped.
-
-```{r load-spe}
+```{r prepare}
 spe <- readRDS(spe_path)
-cat(sprintf("%d genes x %d cells\n", nrow(spe), ncol(spe)))
 
-# Collapse the 17 scClassify sub-states; Mast is dropped at the filter below -> 8 modelled types.
 celltype_map <- c(
-  `CRABP2+ Malignant`  = "Tumour",
-  `ECM1+ Malignant`    = "Tumour",
-  `SCGB2A2+ Malignant` = "Tumour",
-  `ACTA2+ Myoepi`      = "Myoepithelial",
-  `KRT15+ Myoepi`      = "Myoepithelial",
-  `Firoblast`          = "Stromal",
-  `VWF+ Endothelial`   = "Endothelial",
-  `STAB2+ Endothelial` = "Endothelial",
-  `CD4 T`              = "T_Cell",
-  `CD8 T`              = "T_Cell",
-  `B Cells`            = "B_Cell",
-  `Plasma`             = "B_Cell",
-  `Macrophage`         = "Macrophage",
-  `CD163+ Macrophage`  = "Macrophage",
-  `IRF7+ DC`           = "Dendritic_Cell",
-  `LAMP3+ DC`          = "Dendritic_Cell",
-  `Mast cells`         = "Mast"
-)
+  `CRABP2+ Malignant`="Tumour", `ECM1+ Malignant`="Tumour", `SCGB2A2+ Malignant`="Tumour",
+  `ACTA2+ Myoepi`="Myoepithelial", `KRT15+ Myoepi`="Myoepithelial",
+  `Firoblast`="Stromal", `VWF+ Endothelial`="Endothelial", `STAB2+ Endothelial`="Endothelial",
+  `CD4 T`="T_Cell", `CD8 T`="T_Cell", `B Cells`="B_Cell", `Plasma`="B_Cell",
+  `Macrophage`="Macrophage", `CD163+ Macrophage`="Macrophage",
+  `IRF7+ DC`="Dendritic_Cell", `LAMP3+ DC`="Dendritic_Cell", `Mast cells`="Mast")
+cell_types <- c("B_Cell", "Dendritic_Cell", "Endothelial", "Macrophage",
+                "Myoepithelial", "Stromal", "T_Cell", "Tumour")
 
-sc_label <- as.character(colData(spe)$scClassify)
-celltype <- celltype_map[sc_label]
-keep_cell <- !is.na(celltype) & celltype != "Mast"   # drop unassigned + Mast (240 cells; low-n)
-spe       <- spe[, keep_cell]
-celltype  <- celltype[keep_cell]
-print(table(celltype))
+ct   <- celltype_map[as.character(colData(spe)$scClassify)]
+keep <- !is.na(ct) & ct != "Mast"
+spe  <- spe[, keep]
+spe$cellType <- factor(ct[keep], levels = cell_types)
+
+# drop zero-count cells, then per-type detection filter (>= 5% in some type)
+spe <- spe[, colSums(assay(spe, "counts")) > 0]
+counts <- assay(spe, "counts"); ctv <- as.character(spe$cellType)
+det <- vapply(cell_types, function(t)
+  as.numeric(rowMeans(counts[, ctv == t, drop = FALSE] > 0)), numeric(nrow(spe)))
+spe <- spe[apply(det, 1, max) >= 0.05, ]
+
+sprintf("%d cells x %d genes across %d cell types", ncol(spe), nrow(spe),
+        nlevels(spe$cellType))
 ```
 
-# Build `Y` + `df`
+# Fit PACE
 
-`Y` = integer counts (cells × genes); `df` = cell metadata (`x`, `y`,
-`celltype`, `slide`, `nCount`). Zero-count cells are dropped (they break
-the `log(nCount)` offset).
+A single `paceFit()` call runs the whole pipeline. On the full section this takes
+a few minutes on eight cores.
 
-```{r assemble}
-# PACE convention: cells in rows, genes in columns.
-Y <- t(as.matrix(assay(spe, "counts")))
-storage.mode(Y) <- "integer"
-
-cell_data <- colData(spe)
-cell_xy   <- spatialCoords(spe)
-df <- data.frame(
-  cell_id  = as.character(cell_data$cell_id),
-  x        = cell_xy[, 1],
-  y        = cell_xy[, 2],
-  celltype = factor(celltype, levels = cell_types),
-  slide    = as.character(cell_data$slide),
-  stringsAsFactors = FALSE
-)
-
-# Drop zero-count cells (log offset undefined).
-df$nCount    <- rowSums(Y)
-has_counts   <- df$nCount > 0
-df           <- df[has_counts, ]
-Y            <- Y[has_counts, , drop = FALSE]
-
-# Technical FOV grouping for E^tech / within-section centering (NOT an RE block).
-df$imageID <- factor(df$slide)
-
-# Gene QC: keep genes detected in >= min_detection of cells of >= 1 cell type.
-celltype_chr  <- as.character(df$celltype)
-cells_by_type <- lapply(cell_types, function(ct) which(celltype_chr == ct))
-max_detection <- vapply(seq_len(ncol(Y)), function(gene_i) {
-  per_type <- vapply(cells_by_type, function(idx) {
-    if (length(idx) == 0L) 0 else mean(Y[idx, gene_i] > 0)
-  }, numeric(1))
-  max(per_type)
-}, numeric(1))
-
-Y         <- Y[, max_detection >= min_detection, drop = FALSE]
-df$nCount <- rowSums(Y)
-cat(sprintf("%d cells x %d genes; %d slides\n",
-            nrow(Y), ncol(Y), nlevels(df$imageID)))
+```{r fit, cache = TRUE}
+fit <- paceFit(spe,
+               celltype_col      = "cellType",
+               image_col         = "slide",
+               contamination     = "percell_hc",   # per-cell contamination correction
+               dispersion        = "nb1",
+               h_bio = 30, h_tech = 5,
+               drop_sparse_neff  = 30,
+               within_image      = TRUE,
+               edge_correct      = TRUE,
+               data_informed_tau = TRUE,
+               n_iter = 32L, threads = 8L, tau_shrinkage = "adaptive",
+               verbose = FALSE)
+fit
 ```
 
-# PACE fit (per-cell-HC, streaming pipeline)
+The macrophage–tumour flagships reproduce the manuscript (MRC1 −0.156, APOC1 +0.121):
 
-The entire method — neighbour kernels (`K_bio` / `K_tech`), sparse-pair
-dropping and within-section centering, the cross-celltype `E^tech`
-ambient field with isotropic edge correction, the homotypic-core
-negative-control anchors, data-informed τ, and the NB1 penalised
-quasi-likelihood fit — is encapsulated in a single call to
-**`pace_fit_streaming()`** (defined in `stage0/pace_core.R`). The
-memory-bounded *streaming* solver never materialises the dense `E^tech`;
-it streams `ambient_W %*% Y` instead.
-
-`pace_fit_streaming()` is cohort-agnostic: BC, Mel, and any other dataset
-call the **same** function and differ only in arguments. BC passes no
-disease contrast and a single global section.
-
-```{r pace, cache = TRUE}
-res <- pace_fit_streaming(
-  Y = Y, df = df, types = cell_types,
-  celltype_col = "celltype", image_col = "slide", coord_cols = c("x", "y"),
-  h_bio = h_bio, h_tech = h_tech, eps = kernel_radius,
-  contamination     = "percell_hc",   # mu = mu_bio + rho_i * a_ig
-  dispersion        = disp_model,      # canonical: NB1
-  drop_sparse_neff  = min_neff,        # drop (focal, nb) cols with eff. n < 30
-  within_image      = TRUE,            # centre kernels within (slide, celltype)
-  edge_correct      = TRUE,
-  data_informed_tau = TRUE,
-  n_iter = n_iter, threads = pql_threads, tau_shrinkage = tau_shrinkage,
-  verbose = TRUE
-)
-
-# Bind the pieces the reporting + figures read by name.
-fit     <- res$fit
-df      <- res$df            # working frame (kernel columns added)
-Y       <- res$Y
-X_fixed <- res$X_fixed
-K_tech  <- res$K_tech
-K_bio   <- res$K_bio
+```{r flagships}
+neighbourSlopes(fit) |>
+  filter(focal == "Macrophage", neighbour == "Tumour",
+         gene %in% c("MRC1", "APOC1")) |>
+  select(gene, estimate_shrunk, lfsr)
 ```
 
-# mashr shrinkage + variance decomposition + MCSD
+# Figure 2a — per-focal variance decomposition
 
-`pace_shrink()` runs mashr (Urbut 2019) over the neighbour-slope BLUPs.
-`pace_decompose()` partitions within-focal latent variance into
-Cell type / Spatial / Spillover / Residual (the 4-block view, plus the
-raw 5-block table). `pace_top_drivers()` ranks genes per pair by
-`b̃² · spec² · focal_mean` (lfsr < 0.05).
-
-```{r downstream}
-shrunken_long <- pace_shrink(fit, cell_types)
-decomp        <- pace_decompose(fit, df, Y, cell_types, X_fixed)
-gene_decomp   <- decomp$gene_focal_5block   # figures rank against the 5-block table
+```{r fig2a, fig.width = 11, fig.height = 4.5}
+plotDecomposition(fit)
 ```
 
-```{r mcsd}
-# ALL ordered focal != neighbour pairs (omit `pairs=`). The four canonical
-# focal<-Tumour pairs are only a reporting subset, not part of the method.
-pair_drivers <- pace_top_drivers(fit, shrunken_long, decomp, cell_types)
+# Figure 2b — pairwise spatial interactions
 
-for (pair_key in names(pair_drivers)) {
-  top_genes <- head(pair_drivers[[pair_key]]$scores$gene, 8)
-  cat(sprintf("%s  n_sig=%d  (%s): %s\n", pair_key,
-              nrow(pair_drivers[[pair_key]]$scores),
-              pair_drivers[[pair_key]]$status, paste(top_genes, collapse = ", ")))
-}
-
-# Bundle everything a downstream figure script would need.
-mv <- list(
-  fit = fit, shrunken_long = shrunken_long, gene_set = colnames(Y),
-  decomposition = decomp, mcsd_canonical = pair_drivers,
-  h_tech = h_tech, h_bio = h_bio, K_tech = K_tech, K_bio = K_bio,
-  cell_meta = df[, c("cell_id", "nCount", "slide", "celltype")]
-)
+```{r fig2b, fig.width = 6.5, fig.height = 5}
+plotPairHeatmap(fit)
 ```
 
-# Variance-component (τ) diagnostic
+# Figure 2c — macrophage–tumour drivers
 
-`τ` is the empirical-Bayes prior variance of each random-effect coefficient —
-how much that *(focal × term)* effect varies across genes. The **`(Intercept)`
-column is cell-type identity** (large τ); the **neighbour-slope columns are
-mostly ≈0** (shrunk away), leaving a short tail of flagship spatial slopes. It's
-a health-check: shrinkage is large where it should be (identity) and ≈0
-elsewhere, so the slopes that survive are the credible spatial signals.
-
-```{r tau-diagnostic, fig.width = 13, fig.height = 5}
-p.tau <- plot_tau_diagnostic(fit)
+```{r fig2c, fig.width = 10, fig.height = 4.5}
+plotDrivers(fit, "Macrophage", "Tumour")
 ```
 
-<!-- The refit is persisted at the end of the notebook (see the "Save" section). -->
+The other three top pairs from the heatmap:
 
-# Variance decomposition
-
-**4-block VPC** — per focal cell type, the % of within-focal latent
-variance in each block, pooled across genes (Goldstein 2002).
-
-```{r block-vpc}
-mv$decomposition$gene_focal_4block |>
-  group_by(focal) |>
-  summarise(across(
-    c(`Cell type %`, `Spatial state %`, `Spillover %`, `Residual %`),
-    ~ round(mean(.x), 1)
-  )) |>
-  arrange(desc(`Spatial state %`))
+```{r fig2c-other, fig.width = 10, fig.height = 4.5}
+plotDrivers(fit, "Stromal", "Tumour")
+plotDrivers(fit, "B_Cell", "T_Cell")
+plotDrivers(fit, "Tumour", "Myoepithelial")
 ```
 
-**Pratt pair attribution** — the Spatial block split into signed
-`(focal, neighbour)` shares (suppressor neighbours allowed; shares sum
-to the block total).
+# Figure 2d — expression versus tumour proximity
 
-```{r pair-vpc}
-pratt <- pace_pair_variance_pratt(
-  mv, cond_prefix = NULL, cohort_label = "BC", block_label = "Spatial"
-)
-pratt$pair_long |>
-  arrange(desc(within_focal_share_pct)) |>
-  select(focal, neighbour, within_focal_share_pct) |>
-  head(12)
+```{r fig2d, fig.width = 11, fig.height = 4.6}
+plotProximity(fit, spe, c("MRC1", "APOC1"), "Macrophage", "Tumour")
 ```
 
-# Top driver genes per pair
+# Figure 2e — spatial ROI insets
 
-MCSD-ranked drivers (lfsr \< 0.05) for the four canonical BC pairs.
-`b_clean` = mash-shrunken slope; `R2_S` = per-gene spatial variance
-share.
+Two tumour-margin regions of interest, macrophages coloured by MRC1/APOC1 over the
+tumour background (the bespoke `compose_inset_figure()` helper).
 
-```{r drivers}
-for (pair_key in names(pair_drivers)) {
-  cat("\n###", pair_key, "(", pair_drivers[[pair_key]]$status, ")\n")
-  pair_drivers[[pair_key]]$scores |>
-    head(10) |>
-    select(rank, gene, MCSD, b_clean, spec, focal_mean, R2_S, lfsr) |>
-    print()
-}
+```{r fig2e, fig.width = 12, fig.height = 7}
+cp10k <- log1p(t(t(as.matrix(assay(spe, "counts"))) /
+                 pmax(colSums(assay(spe, "counts")), 1) * 1e4))          # genes x cells
+plot_df <- data.frame(
+  x        = spatialCoords(spe)[, 1],
+  y        = spatialCoords(spe)[, 2],
+  celltype = as.character(spe$cellType),
+  MRC1     = cp10k["MRC1", ],
+  APOC1    = cp10k["APOC1", ])
+
+compose_inset_figure(
+  plot_df, genes = c("MRC1", "APOC1"), focal = "Macrophage", neighbour = "Tumour",
+  xlim1 = c(6300, 7300), ylim1 = c(3700, 4700),
+  xlim2 = c(6500, 7500), ylim2 = c(2300, 3300))
 ```
 
-# Decomposition figures
+# Supplementary — contamination anchor genes
 
-The panels from the canonical composite (`plot_bc313_composites_all.R`),
-reproduced on this notebook's `mv`. **All panels use the canonical single-frame
-decomposition** (observed CP10k denominator; the headline frame, spatial
-1.8-5.8%, not the link-scale ~1% of `gene_focal_4block`). The stage-0
-`pace_decompose()` does not build it, so we compute it here from the locked
-4-block proportions with `single_frame_decomp_obs()`.
-
-```{r single-frame}
-# CANONICAL single-frame per-(gene,focal) decomposition (observed denominator).
-mv$decomposition$gene_focal_single_frame <- single_frame_decomp_obs(
-  Y, df$celltype, df$nCount, mv$decomposition$gene_focal_4block)
-sf <- mv$decomposition$gene_focal_single_frame
-
-# Pooled (over genes) single-frame block % per focal cell type.
-focal_blocks <- sf |>
-  mutate(ss_cell = `Cell type %` / 100 * denom,
-         ss_sp   = `Spatial %`   / 100 * denom,
-         ss_bl   = `Spillover %` / 100 * denom,
-         ss_rs   = `Residual %`  / 100 * denom) |>
-  group_by(focal) |>
-  summarise(`Cell type`          = 100 * sum(ss_cell) / sum(denom),
-            `Spatial cell state` = 100 * sum(ss_sp)   / sum(denom),
-            `Spillover`          = 100 * sum(ss_bl)   / sum(denom),
-            `Residual`           = 100 * sum(ss_rs)   / sum(denom),
-            .groups = "drop")
-```
-
-**Per-focal decomposition (bar + zoom)** via the locked
-`plot_stacked_bar_focal_no_resp()` (full stack + a zoom of the small Spatial +
-Spillover blocks), single-frame values.
-
-```{r decomp-bar, fig.width = 13, fig.height = 5}
-blks_all <- focal_blocks |>
-  transmute(focal,
-            `Cell type`          = `Cell type` / 100,
-            `Spatial cell state` = `Spatial cell state` / 100,
-            `Spillover`          = `Spillover` / 100,
-            `Residuals`          = `Residual` / 100) |>
-  pivot_longer(-focal, names_to = "block", values_to = "pct_total")
-
-p.decomp <- plot_stacked_bar_focal_no_resp(
-  blks_all,
-  block_levels = c("Cell type", "Spatial cell state", "Spillover", "Residuals"),
-  title = "Per-focal decomposition")
-```
-
-**Pairwise spatial % heatmap.** Each cell = the % of the focal type's TOTAL
-variance contributed by spatial interaction with that neighbour: the focal's
-single-frame spatial % (panel above) split across neighbours by the
-off-diagonal-renormalised Pratt share (`foc_sp × V_pair / Σ V_pair`). Matches
-`plot_bc313_composites_all.R` panel C.
-
-```{r decomp-heatmap, fig.width = 6, fig.height = 4}
-TYPES  <- sort(unique(as.character(df$celltype)))
-foc_sp <- setNames(focal_blocks$`Spatial cell state`,
-                   as.character(focal_blocks$focal))
-
-pratt_long <- pace_pair_variance_pratt(
-  mv, cond_prefix = NULL, cohort_label = "BC", block_label = "Spatial")$pair_long |>
-  filter(as.character(focal) != as.character(neighbour)) |>
-  group_by(focal) |>
-  mutate(val = foc_sp[as.character(focal)] * V_pair_pratt / sum(V_pair_pratt)) |>
-  ungroup() |>
-  transmute(focal = as.character(focal),
-            neighbour = as.character(neighbour), val)
-
-# Fill the full focal x neighbour grid (undefined/dropped pairs -> 0; diagonal blank).
-heat <- expand.grid(focal = TYPES, neighbour = TYPES, stringsAsFactors = FALSE) |>
-  filter(focal != neighbour) |>
-  left_join(pratt_long, by = c("focal", "neighbour")) |>
-  mutate(val       = ifelse(is.na(val), 0, val),
-         focal     = factor(focal, levels = TYPES),
-         neighbour = factor(neighbour, levels = rev(TYPES)))
-
-p.heat <- ggplot(heat, aes(focal, neighbour, fill = val)) +
-  geom_tile(colour = "grey92", linewidth = 0.3) +
-  geom_text(aes(label = ifelse(abs(val) < 0.005, "0.00", sprintf("%.2f", val))),
-            size = 2.4, colour = "white") +
-  scale_fill_viridis_c(option = "inferno", na.value = "white",
-                       name = "spatial %\nof total") +
-  coord_equal() +
-  labs(x = "Focal", y = "Neighbour",
-       title = "Pairwise spatial % (variance, normalised Pratt)") +
-  theme_classic(base_size = 11) +
-  theme(axis.text.x = element_text(angle = 45, hjust = 1),
-        plot.title = element_text(hjust = 0.5))
-```
-
-**Strong/weak split of the Pratt pair variance.** The pairwise Pratt above pools
-a covariance sum over all genes, so it is far less null-diluted than a mean of
-per-gene ratios. To make that explicit (and null-robust by construction) we split
-each pair's per-gene Pratt contribution into a STRONG component carried by the
-significant driver genes (lfsr < 0.05) and a WEAK component carried by the rest,
-following the strong-localized / weak-diffuse partition of Nan-Azriel-Schwartzman
-(2026). STRONG + WEAK reproduces the total above; the STRONG panel is the
-null-robust fill and WEAK is the diagnostic of how much of each pair was
-null-carried. `pace_pair_variance_pratt_strong_weak()` is auto-sourced from
-`scripts/helpers/`; it does not modify the locked Pratt helper.
-
-```{r decomp-heatmap-strong-weak, fig.width = 6, fig.height = 4}
-# Same foc_sp scaling as the total-Pratt heatmap above, applied to each component.
-pratt_sw <- pace_pair_variance_pratt_strong_weak(
-  mv, cond_prefix = NULL, cohort_label = "BC") |>
-  filter(as.character(focal) != as.character(neighbour)) |>
-  group_by(focal) |>
-  mutate(denom      = sum(V_pair_pratt),
-         strong_pct = foc_sp[as.character(focal)] * V_pair_strong / denom,
-         weak_pct   = foc_sp[as.character(focal)] * V_pair_weak   / denom,
-         pair_pct   = foc_sp[as.character(focal)] * V_pair_pratt  / denom) |>
-  ungroup() |>
-  transmute(focal = as.character(focal), neighbour = as.character(neighbour),
-            n_strong, pair_pct, strong_pct, weak_pct,
-            pct_from_strong = 100 * V_pair_strong / V_pair_pratt)
-
-# Table: top pairs by the null-robust STRONG share.
-pratt_sw |>
-  arrange(desc(strong_pct)) |>
-  mutate(across(c(pair_pct, strong_pct, weak_pct, pct_from_strong), \(x) round(x, 3))) |>
-  head(12) |>
-  knitr::kable(caption = "BC Pratt pair % split: STRONG (drivers) vs WEAK (nulls)")
-
-# STRONG-filled heatmap (null-robust); mirrors the total-Pratt heatmap style.
-heat_strong <- expand.grid(focal = TYPES, neighbour = TYPES, stringsAsFactors = FALSE) |>
-  filter(focal != neighbour) |>
-  left_join(pratt_sw |> select(focal, neighbour, strong_pct), by = c("focal", "neighbour")) |>
-  mutate(strong_pct = ifelse(is.na(strong_pct), 0, strong_pct),
-         focal      = factor(focal, levels = TYPES),
-         neighbour  = factor(neighbour, levels = rev(TYPES)))
-
-p.heat_strong <- ggplot(heat_strong, aes(focal, neighbour, fill = strong_pct)) +
-  geom_tile(colour = "grey92", linewidth = 0.3) +
-  geom_text(aes(label = ifelse(abs(strong_pct) < 0.005, "0.00", sprintf("%.2f", strong_pct))),
-            size = 2.4, colour = "white") +
-  scale_fill_viridis_c(option = "inferno", na.value = "white",
-                       name = "spatial %\nof total\n(drivers)") +
-  coord_equal() +
-  labs(x = "Focal", y = "Neighbour",
-       title = "Pairwise spatial % — strong-localized (driver-gene) Pratt") +
-  theme_classic(base_size = 11) +
-  theme(axis.text.x = element_text(angle = 45, hjust = 1),
-        plot.title = element_text(hjust = 0.5))
-p.heat_strong
-
-# Persist the strong/weak decomposition on the fit object (saved at the end).
-mv$pratt_strong_weak <- pratt_sw
-```
-
-**Ligand-receptor annotation of the top pairs (CellChatDB).** An interpretation
-layer on the drivers: for each top focal<-neighbour pair, every significant
-driver is checked against CellChatDB; if it is a ligand or a receptor subunit,
-the cognate partner is named and its expression in the NEIGHBOUR cell type is
-reported, turning the spatial coupling into a candidate signaling axis. The
-313-panel measures only a handful of complete LR pairs, so this is a targeted
-annotation, not an LR screen. Because the drivers are contamination-corrected,
-an axis built on them is cleaner than raw spatial LR co-expression (which is
-confounded by segmentation spillover). `pace_lr_annotate()` is auto-sourced from
-`scripts/helpers/`; homotypic/adhesion pairs (CDH1, PECAM1) are flagged, and
-one-sided hits (cognate partner off-panel) are counted but not tabulated. The
-table is ordered by `driver_pctile` — how prominent the driver is among the
-pair's significant drivers by |slope| — so the axes that genuinely reflect the
-PACE result (e.g. EDN1 in Endothelial, rank 1; CXCL12/MRC1 in Macrophage, ranks
-3/5) sit at the top and marginal tail hits are visible as such. `direction`
-states whether the gene rises or falls with neighbour density; several strong
-axes are *down*-near-tumour, so they should be read as *suppression* in
-proximity, not an activated signaling axis.
-
-```{r lr-annotation}
-if (requireNamespace("CellChat", quietly = TRUE)) {
-  top_pairs_bc <- pratt_sw |> dplyr::arrange(dplyr::desc(strong_pct)) |> head(6)
-  pair_list    <- Map(function(f, n) c(f, n), top_pairs_bc$focal, top_pairs_bc$neighbour)
-  lr_bc        <- pace_lr_annotate(mv, pair_list)
-  mv$lr_axes   <- lr_bc                                  # persisted with the saved fit
-  adhesion     <- unique(lr_bc$driver[lr_bc$class != "paracrine"])
-  cat(sprintf("Adhesion/homotypic (flagged): %s  |  one-sided candidates (partner off-panel): %d\n",
-              paste(adhesion, collapse = ", "), sum(!lr_bc$partner_on_panel)))
-} else {
-  message("CellChat not installed - skipping ligand-receptor annotation."); lr_bc <- NULL
-}
-
-if (!is.null(lr_bc)) {
-  lr_bc |>
-    dplyr::filter(partner_on_panel, class == "paracrine") |>
-    dplyr::arrange(dplyr::desc(driver_pctile)) |>          # strongest-PACE-driver axes first
-    dplyr::transmute(pair = paste0(focal, " <- ", neighbour), driver, role, direction,
-                     driver_rank, partner, category, partner_where, partner_spec) |>
-    knitr::kable(caption = "Candidate LR axes behind BC top pairs, ranked by PACE-driver prominence (CellChatDB). category = CellChatDB interaction type; partner_where = compartment expressing the cognate partner (autocrine = focal, paracrine = neighbour); partner_spec = partner expression there relative to its cross-cell-type max. The dot plot below keeps only Secreted-Signaling axes with partner_spec >= 0.2.")
-}
-```
-
-Standard ligand-receptor **dot plot** (CellPhoneDB / LIANA style): focal<-neighbour
-pairs on x, ligand->receptor axes on y, dot **size = PACE driver prominence**
-(percentile) and **colour = driver slope** (blue = down / red = up near the
-neighbour). Bidirectional axes are collapsed to the more prominent side. Two
-credibility filters keep it to plausible signaling (both adjustable in
-`pace_lr_dotplot()`): only **Secreted-Signaling** CellChatDB interactions
-(dropping the soft Cell-Cell-Contact set, e.g. the spurious PTPRC->MRC1 where
-MRC1 is a macrophage receptor absent from T cells), and only axes whose cognate
-partner is genuinely expressed in the focal or neighbour (`partner_spec >= 0.2`,
-direction-aware so real autocrine axes such as EDN1->EDNRB survive).
-
-```{r lr-dotplot, fig.width = 8.5, fig.height = 5.5}
-if (!is.null(lr_bc)) {
-  print(pace_lr_dotplot(lr_bc, "Candidate ligand-receptor axes behind BC top spatial couplings"))
-}
-```
-
-**MCSD drivers + per-gene variance for one pair.** Pick a focal-neighbour pair
-(default the Stromal ← Tumour flagship): the left bar ranks its top genes by
-MCSD, the right shows each gene's single-frame block decomposition (% of total
-variance; residual is the implied remainder).
-
-```{r decomp-pair-genes, fig.width = 12, fig.height = 5}
-# make_pair_composite() lives in scripts/core/06a-plots-decomp.R (sourced in setup).
-# panels = "both" | "mcsd" | "gene"; change the pair to render any mv$mcsd_canonical pair.
-p_stro_tum <- make_pair_composite("Stromal", "Tumour", mv, sf, n_top = 5)
-p_mac_tum <- make_pair_composite("Macrophage", "Tumour", mv, sf, n_top = 5)
-p_bcell_tcell <- make_pair_composite("B_Cell", "T_Cell", mv, sf, n_top = 5)
-p_tum_myoepi <- make_pair_composite("Tumour", "Myoepithelial", mv, sf, n_top = 5)
-```
-
-# Contamination diagnostics
-
-The per-cell-HC model estimates one loading `ρ_i` per cell (shared
-across genes, fixed ambient direction). Its distribution + the Spillover
-variance share show how much technical bleed the model absorbed, keeping
-it out of the spatial slopes.
-
-```{r contam}
-rho <- fit$percell_bleed_rho
-cat(sprintf("rho_i: median %.4f, IQR [%.4f, %.4f], frac>0 %.2f\n",
-            median(rho), quantile(rho, .25), quantile(rho, .75), mean(rho > 0)))
-
-p_rho <- ggplot(data.frame(rho = rho), aes(rho)) +
-  geom_histogram(bins = 60, fill = "#4292C6", colour = NA) +
-  geom_vline(xintercept = median(rho), linetype = 2) +
-  labs(x = expression(rho[i] ~ "(per-cell contamination loading)"),
-       y = "cells", title = "Per-cell contamination loading") +
-  theme_bw()
-
-spillover_by_focal <- mv$decomposition$gene_focal_4block |>
-  group_by(focal) |>
-  summarise(`Spillover %` = mean(`Spillover %`))
-
-p_spill <- ggplot(spillover_by_focal,
-                  aes(reorder(focal, `Spillover %`), `Spillover %`)) +
-  geom_col(fill = "#E6550D") +
-  coord_flip() +
-  labs(x = NULL, y = "Spillover variance share (%)",
-       title = "Spillover block by focal type") +
-  theme_bw()
-
-p_rho | p_spill
-```
-
-# MCSD neighbour-count boxplots
-
-For the top two pairs, the top MCSD gene's raw counts across bins of the
-number of tumour neighbours within 30 µm of each focal cell — the spatial
-gradient the slope captures. Box = distribution, dot = per-bin mean.
-
-```{r boxplots, fig.width = 10, fig.height = 4}
-# density_bin_boxplot() / top_gene() are in helpers/notebook_analysis_helpers.R
-
-p_den_stro_tum <- density_bin_boxplot("Stromal", "Tumour", gene_name = c("ADH1B", "CCDC80", "CXCL12", "SFRP4"))
-p_den_mac_tum <- density_bin_boxplot("Macrophage", "Tumour", gene_name = c("MRC1", "CD14", "APOC1", "C1QA"))
-p_den_bcell_tcell <- density_bin_boxplot("B_Cell", "T_Cell", gene_name = c("TENT5C", "MZB1", "MS4A1", "PRDM1"))
-p_den_tum_myoepi <- density_bin_boxplot("Tumour", "Myoepithelial", gene_name = c("ABCC11", "SERHL2", "FASN", "FOXA1"))
-```
-
-# Spatial inset figures
-
-Cell-type spatial map with two tumour-duct ROIs zoomed as insets, focal
-cells heat-coloured by gene expression. Uses the canonical
-`compose_inset_figure` helper. Shows the top two genes for the top three
-pairs.
-
-```{r insets-data}
-# compose_inset_figure() is auto-sourced in the setup chunk.
-
-# Plotting df: coords + cell type + log-CP10K for the genes we inset.
-plot_df <- data.frame(x = df$x, y = df$y, celltype = as.character(df$celltype))
-inset_genes <- c("ADH1B", "CCDC80", "MRC1", "APOC1", "ABCC11", "SERHL2")
-inset_genes <- inset_genes[inset_genes %in% colnames(Y)]
-for (gene in inset_genes) {
-  plot_df[[gene]] <- log1p(1e4 * Y[, gene] / df$nCount)
-}
-
-# Two right-side tumour-ring ROIs (box 1 = orange, box 2 = blue).
-roi1_x <- c(6300, 7300); roi1_y <- c(3700, 4700)
-roi2_x <- c(6500, 7500); roi2_y <- c(2300, 3300)
-```
-
-```{r inset-stromal, fig.width = 13, fig.height = 7}
-if (all(c("ADH1B", "CCDC80") %in% colnames(plot_df))) {
-  p_inset_stro_tum <- compose_inset_figure(
-    plot_df, genes = c("ADH1B", "CCDC80"),
-    focal = "Stromal", neighbour = "Tumour",
-    roi1_x, roi1_y, roi2_x, roi2_y
-    # roi_col1 = "darkorange", roi_col2 = "steelblue"
-  )
-}
-```
-
-```{r inset-mac, fig.width = 13, fig.height = 7}
-if (all(c("MRC1", "APOC1") %in% colnames(plot_df))) {
-  p_inset_mac_tum <- compose_inset_figure(
-    plot_df, genes = c("MRC1", "APOC1"),
-    focal = "Macrophage", neighbour = "Tumour",
-    roi1_x, roi1_y, roi2_x, roi2_y
-    # roi_col1 = "darkorange", roi_col2 = "steelblue"
-  )
-}
-```
-
-```{r inset-tum, fig.width = 13, fig.height = 7}
-if (all(c("ABCC11", "SERHL2") %in% colnames(plot_df))) {
-  p_inset_tum_myoepi <- compose_inset_figure(
-    plot_df, genes = c("ABCC11", "SERHL2"),
-    focal = "Tumour", neighbour = "Myoepithelial",
-    roi1_x, roi1_y, roi2_x, roi2_y
-    # roi_col1 = "darkorange", roi_col2 = "steelblue"
-  )
-}
-```
-
-# Save the PDFs
-```{r}
-pdf("../figures/bc/all_plots.pdf", width = 16, height = 8)
-p.tau
-p.decomp
-p.heat
-p_stro_tum
-p_mac_tum
-p_bcell_tcell
-p_tum_myoepi
-p_den_stro_tum
-p_den_mac_tum
-p_den_bcell_tcell
-p_den_tum_myoepi
-p_inset_stro_tum
-p_inset_mac_tum
-p_inset_tum_myoepi
-dev.off()
-```
-
-
-# Save
-
-Persist this notebook's refit — including the strong/weak Pratt decomposition
-(`mv$pratt_strong_weak`) attached above — to `output_path`. This writes a
-notebook-specific file (`..._notebook.rds`), NOT the canonical fit.
-
-```{r save-fit}
-saveRDS(mv, "../data/breast_cancer/canonical_fit.rds")
+```{r anchors}
+anchorGenes(fit, spe)
 ```
 
 # Session info
 
-```{r session}
+```{r sessioninfo}
 sessionInfo()
 ```
