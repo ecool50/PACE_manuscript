@@ -26,15 +26,17 @@ cd PACE_manuscript
 Rscript setup_environment.R
 
 # ~several-GB analysis archive from Zenodo, unzipped in place under
-# data/ and pace_mv/data/ (see fetch_data.R for the Zenodo record)
+# data/ (see fetch_data.R for the Zenodo record)
 Rscript fetch_data.R
 
 # render the primary breast cancer analysis (Figure 2)
 quarto render pace_mv/notebooks/analysis_bc.qmd
 ```
 
-Each notebook refits PACE from the raw data and regenerates its figures; a fit
-takes a few minutes on a standard workstation.
+Every analysis is driven by the [PACE package](https://github.com/ecool50/PACE):
+each notebook refits PACE from the raw data with `paceFit()` and regenerates its
+figures with the package's plotting functions. A fit takes a few minutes on a
+standard workstation.
 
 ## Prerequisites
 
@@ -55,10 +57,10 @@ paths the notebooks read from:
 |------|----------|
 | `data/spe_10x_nuclei_withMetrics.rds` | Breast cancer Xenium `SpatialExperiment` (10x public data, BIDCell segmentation) |
 | `data/simvi_melanoma/14708000/Melanoma_5612.h5ad` | Melanoma CosMx cohort (from the SIMVI study) |
-| `pace_mv/data/breast_cancer/` | breast cancer inputs and fits |
-| `pace_mv/data/simvi_melanoma/` | melanoma inputs and fits |
 
-Set the Zenodo record ID in `fetch_data.R` before first use.
+These two raw inputs are all the notebooks require; PACE fits and the
+competitor-method results are regenerated (and cached under `data/`) on first
+render. Set the Zenodo record ID in `fetch_data.R` before first use.
 
 ## Which notebook makes which figure
 
@@ -80,13 +82,15 @@ PACE_manuscript/
   fetch_data.R             # download the analysis data from Zenodo
   pace_mv/
     notebooks/             # the five analysis notebooks above
-    scripts/               # analysis engine: core/, helpers/ (+ C++), figures/, builders/
-    streaming/helpers/     # the streaming PQL solver
-    stage0/                # the PACE pipeline functions + exact-reproduction scripts
-    data/                  # fetched (breast cancer + melanoma inputs/fits)
-  scripts/model_scripts_lite/helpers/   # DenoIST count-level correction (Figure 3)
-  data/                    # fetched (raw SPE + h5ad)
+    helpers/               # repo-local helpers: ROI-inset figure + DenoIST correction
+  data/                    # fetched (raw SPE + h5ad), never committed
 ```
+
+The PACE method itself (model fitting, contamination correction, shrinkage,
+variance decomposition, driver scores, and the standard figures) lives entirely
+in the [PACE package](https://github.com/ecool50/PACE). This repository only adds
+the cohort-specific data preparation, the bespoke ROI-inset figure, and the
+competitor methods (niche-DE, SpatioMark, DenoIST).
 
 ## Citation
 
