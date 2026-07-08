@@ -25,8 +25,8 @@ cd PACE_manuscript
 # R + Bioconductor deps, the PACE package, and the comparison methods
 Rscript setup_environment.R
 
-# ~several-GB analysis archive from Zenodo, unzipped in place under
-# data/ (see fetch_data.R for the Zenodo record)
+# the two raw inputs (~0.6 GB): melanoma from the public SIMVI Zenodo
+# record, breast cancer from the author deposit (see fetch_data.R)
 Rscript fetch_data.R
 
 # render the primary breast cancer analysis (Figure 2)
@@ -49,18 +49,18 @@ standard workstation.
 
 ## Data
 
-The raw inputs and precomputed fits are too large for git and are archived on
-Zenodo. `fetch_data.R` downloads a single md5-verified archive that unzips to the
-paths the notebooks read from:
+The two raw inputs are too large for git; `fetch_data.R` downloads and
+md5-verifies each into the paths the notebooks read from:
 
-| Path | Contents |
-|------|----------|
-| `data/spe_10x_nuclei_withMetrics.rds` | Breast cancer Xenium `SpatialExperiment` (10x public data, BIDCell segmentation) |
-| `data/simvi_melanoma/14708000/Melanoma_5612.h5ad` | Melanoma CosMx cohort (from the SIMVI study) |
+| Path | Contents | Source |
+|------|----------|--------|
+| `data/simvi_melanoma/14708000/Melanoma_5612.h5ad` | Melanoma CosMx cohort | Public SIMVI record [10.5281/zenodo.14708000](https://doi.org/10.5281/zenodo.14708000) (Dong et al., CC BY 4.0) — fetched automatically |
+| `data/spe_10x_nuclei_withMetrics.rds` | Breast cancer Xenium `SpatialExperiment` (10x public data, BIDCell segmentation) | Author deposit — set `BC_URL`/`BC_MD5` in `fetch_data.R` |
 
-These two raw inputs are all the notebooks require; PACE fits and the
+These two inputs are all the notebooks require; PACE fits and the
 competitor-method results are regenerated (and cached under `data/`) on first
-render. Set the Zenodo record ID in `fetch_data.R` before first use.
+render. The melanoma download needs no configuration; only the breast cancer
+`BC_URL`/`BC_MD5` must be filled in before first use.
 
 ## Which notebook makes which figure
 
