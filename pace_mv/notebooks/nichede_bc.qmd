@@ -61,19 +61,13 @@ if (!requireNamespace("nicheDE", quietly = TRUE)) {
   stop("nicheDE not installed. Run: remotes::install_github('kaishumason/NicheDE')")
 }
 library(nicheDE)
+library(PACE)
 
-# Run from pace_mv/ (mirrors analysis_bc.qmd).
-setwd("../../pace_mv")
-
-spe_path  <- "../../data/spe_10x_nuclei_withMetrics.rds"
-pace_path <- "../../data/breast_cancer/mvpql_percell_hc.rds"   # PACE drivers for comparison
-# Resolve to an ABSOLUTE path so readRDS works regardless of the chunk's working
-# dir (knitr runs each chunk from the document dir, not the setup chunk's setwd).
-for (cand in c(pace_path, file.path("..", pace_path), file.path("pace_mv", pace_path))) {
-  if (file.exists(cand)) { pace_path <- normalizePath(cand); break }
-}
+spe_path  <- "../../data/spe_10x_nuclei_withMetrics.rds"   # fetched by fetch_data.R
 out_dir   <- "figures/nichede"
 dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+cache_dir <- "../../data/breast_cancer"                    # niche-DE fit caches
+dir.create(cache_dir, showWarnings = FALSE, recursive = TRUE)
 
 min_detection <- 0.05
 # niche-DE Gaussian bandwidths (µm), bracketing PACE's biological kernel (h_bio = 30 µm):
@@ -116,7 +110,36 @@ celltype  <- celltype_map[sc_label]
 keep_cell <- !is.na(celltype) & celltype != "Mast"   # drop unassigned + Mast
 spe       <- spe[, keep_cell]
 celltype  <- celltype[keep_cell]
+spe$cellType <- factor(celltype, levels = sort(cell_types))   # alphabetical: matches analysis_bc.qmd
 print(table(celltype))
+```
+
+# Fit the PACE baseline via the package
+
+The PACE comparison arm is a single `paceFit()` call with the identical
+configuration to `analysis_bc.qmd` (same cells, gene QC, and knobs), so the
+drivers below are exactly the manuscript's.
+
+```{r pace-fit, cache = TRUE}
+spe_pace <- spe[, colSums(assay(spe, "counts")) > 0]           # drop zero-count cells
+cnt_pace <- assay(spe_pace, "counts"); ctv_pace <- as.character(spe_pace$cellType)
+det_pace <- vapply(sort(cell_types), function(t)               # per-type detection filter
+  as.numeric(rowMeans(cnt_pace[, ctv_pace == t, drop = FALSE] > 0)), numeric(nrow(spe_pace)))
+spe_pace <- spe_pace[apply(det_pace, 1, max) >= min_detection, ]
+
+fit <- paceFit(spe_pace,
+               celltype_col      = "cellType",
+               image_col         = "slide",
+               contamination     = "percell_hc",
+               dispersion        = "nb1",
+               h_bio = 30, h_tech = 5,
+               drop_sparse_neff  = 30,
+               within_image      = TRUE,
+               edge_correct      = TRUE,
+               data_informed_tau = TRUE,
+               n_iter = 32L, threads = 8L, tau_shrinkage = "adaptive",
+               verbose = FALSE)
+fit
 ```
 
 # Build niche-DE inputs
@@ -170,9 +193,8 @@ cat(sprintf("%d cells x %d genes; deconv %s; library %s\n",
 ```{r nichede-fit, cache = TRUE}
 # Cache the heavy niche_DE() fit (minutes-hours on ~126k cells) to disk, so
 # re-runs LOAD the saved result instead of recomputing. Delete the file to force
-# a fresh fit. Path derived from the already-absolute pace_path (chunks run from
-# the document dir, so a bare relative path would land in notebooks/).
-nde_cache <- file.path(dirname(dirname(pace_path)), "nichede_bc_nde.rds")
+# a fresh fit.
+nde_cache <- file.path(cache_dir, "nichede_bc_nde.rds")
 
 if (file.exists(nde_cache)) {
   nde <- readRDS(nde_cache)
@@ -227,7 +249,7 @@ return `NA` (a singular negative-binomial variance, a modelling limit — not th
 gate), so coverage lands below the full 275 × 56 but well above the gated ~3080.
 
 ```{r nichede-fit-unfiltered, cache = TRUE}
-nde_unf_cache <- file.path(dirname(dirname(pace_path)), "nichede_bc_nde_unfiltered.rds")
+nde_unf_cache <- file.path(cache_dir, "nichede_bc_nde_unfiltered.rds")
 
 if (file.exists(nde_unf_cache)) {
   nde_unf <- readRDS(nde_unf_cache)
@@ -279,9 +301,9 @@ for (k in names(nde_genes)) {
 
 # Compare to PACE drivers
 
-PACE drivers come from the locked fit (`mvpql_percell_hc.rds`); the canonical
-focal←Tumour pairs do not involve Mast, so the 9-CT PACE fit is comparable to
-this 8-CT niche-DE run. As for the SpatioMark comparison we report **overlap
+PACE drivers come from the package fit above (`paceFit()`, the same eight-cell-type
+fit as `analysis_bc.qmd`), read out with `neighbourSlopes()` and `topDrivers()`.
+As for the SpatioMark comparison we report **overlap
 coefficient** (shared / smaller set), a **rank correlation** of effect vs
 evidence, **hypergeometric** overlap p, plus direction concordance (Jaccard kept
 for reference).
@@ -292,12 +314,12 @@ for reference).
 > monotonic-agreement check, not an effect-vs-effect correlation like SpatioMark.
 
 ```{r compare}
-mv <- readRDS(pace_path)
-n_universe <- ncol(counts)                    # genes tested (panel)
+pace_slopes <- neighbourSlopes(fit)           # shrunken per-(gene, focal, neighbour) slopes
+n_universe  <- ncol(counts)                   # genes tested (panel)
 
 # PACE: all genes for a pair (threshold-free effect = mash-shrunken slope).
 pace_full <- function(fo, nb) {
-  mv$shrunken_long |>
+  pace_slopes |>
     filter(focal == fo, neighbour == nb, term == nb) |>
     distinct(gene, .keep_all = TRUE) |>
     transmute(gene, pace_eff = estimate_shrunk, pace_sig = lfsr < 0.05)
@@ -408,7 +430,7 @@ genes both methods call significant.
 N_top <- 15
 
 pace_rank_tbl <- function(fo, nb) {
-  s <- mv$mcsd_canonical[[paste(fo, nb, sep = "_")]]$scores
+  s <- topDrivers(fit)[[paste(fo, nb, sep = "_")]]$scores
   if (is.null(s) || !nrow(s)) return(data.frame(gene = character(), pace_rank = integer()))
   s |> arrange(rank) |> transmute(gene, pace_rank = row_number())   # MCSD order
 }
@@ -473,7 +495,7 @@ N_top <- 15
 
 # PACE specificity + MCSD rank for all PACE-significant genes, per pair.
 pace_spec_tbl <- function(fo, nb) {
-  s <- mv$mcsd_canonical[[paste(fo, nb, sep = "_")]]$scores
+  s <- topDrivers(fit)[[paste(fo, nb, sep = "_")]]$scores
   if (is.null(s) || !nrow(s)) return(data.frame())
   s |> arrange(rank) |> transmute(gene, spec, pace_rank = row_number())
 }

@@ -51,9 +51,9 @@ and read out three panels:
 
 # Setup
 
-Same setup as `analysis_bc.qmd` (`scripts/zzz.R` auto-sources `scripts/core`
-then `scripts/helpers`), plus the streaming solver, the `pace_core.R` pipeline,
-and the DenoIST correction helper from the sibling `model_scripts_lite/` tree.
+The PACE arms are fit with the [PACE package](https://github.com/ecool50/PACE)
+(`paceFit()`, same configuration as `analysis_bc.qmd`). DenoIST is the competitor
+correction, run from the repo-local `helpers/denoist_correction.R`.
 
 ```{r setup}
 rm(list = ls())
@@ -72,20 +72,14 @@ suppressPackageStartupMessages({
 })
 options(dplyr.summarise.inform = FALSE)
 
-# Run from pace_mv/ wherever this notebook is launched (mirrors analysis_bc.qmd).
-setwd("../../pace_mv")
-
-source("scripts/zzz.R")                                # core + helpers + C++ (auto)
-source("streaming/helpers/pace_mvpql_streaming.R")     # streaming solver
-source("stage0/pace_core.R")                           # pace_fit_streaming(), etc.
-source("../scripts/model_scripts_lite/helpers/denoist_correction.R")  # correct_spe_denoist()
+library(PACE)                                          # the four PACE arms
+source("../helpers/denoist_correction.R")              # DenoIST competitor: correct_spe_denoist()
 ```
 
 ```{r config}
 # ---- canonical model knobs (identical to analysis_bc.qmd) ----
 h_tech        <- 5            # optical-bleed kernel scale (µm)
-h_bio         <- 30           # biological-proximity kernel scale (µm)
-kernel_radius <- 3 * h_bio    # frNN truncation radius (µm)
+h_bio         <- 30           # biological-proximity kernel scale (µm; paceFit truncates at 3*h_bio)
 min_detection <- 0.05         # gene QC: detected in >= 5% of cells of >= 1 type
 min_neff      <- 30           # drop (focal, neighbour) kernel cols with eff. n < 30
 n_iter        <- 32           # PQL outer iterations
@@ -207,47 +201,56 @@ cat(sprintf("%d cells x %d genes; %d slides\n",
 
 # Fit the four arms
 
-Each arm is a full `pace_fit_streaming()` call with the exact `analysis_bc.qmd`
-configuration, varying only the counts and the `contamination` flag. This is the
-heavy step (four BC fits); `cache = TRUE` avoids refitting on re-render.
+Each arm is a full `paceFit()` call with the exact `analysis_bc.qmd` configuration,
+varying only the counts (raw / DenoIST) and the `contamination` flag. This is the
+heavy step (four BC fits); `cache = TRUE` avoids refitting on re-render. The fitted
+`PACEFit` carries the raw solver state in its `@fit` slot (used by panels A/B) and
+the variance decomposition (used by panel C).
 
 ```{r fit-arms, cache = TRUE}
-# Returns the full res (fit for panels A/B; df/Y/X_fixed for panel C's decompose).
+# Build a SpatialExperiment for a given count matrix (cells x genes), then fit PACE.
+# All four arms share the same design (df); only the counts / contamination vary.
+build_arm_spe <- function(Y_counts) {
+  cnt <- t(Y_counts)                                    # genes x cells
+  cn  <- make.unique(as.character(df$cell_id))
+  rownames(cnt) <- colnames(Y_counts); colnames(cnt) <- cn
+  SpatialExperiment(
+    assays  = list(counts = cnt),
+    colData = DataFrame(cellType = factor(df$celltype, levels = sort(cell_types)),
+                        slide = df$slide, row.names = cn),
+    spatialCoords = as.matrix(df[, c("x", "y")]))
+}
 fit_arm <- function(Y_counts, contamination_mode) {
-  pace_fit_streaming(
-    Y = Y_counts, df = df, types = cell_types,
-    celltype_col = "celltype", image_col = "slide", coord_cols = c("x", "y"),
-    h_bio = h_bio, h_tech = h_tech, eps = kernel_radius,
-    contamination     = contamination_mode,   # "none" | "percell_hc"
-    dispersion        = disp_model,
-    drop_sparse_neff  = min_neff,
-    within_image      = TRUE,
-    edge_correct      = TRUE,
-    data_informed_tau = TRUE,
-    n_iter = n_iter, threads = pql_threads, tau_shrinkage = tau_shrinkage,
-    verbose = TRUE
-  )
+  paceFit(build_arm_spe(Y_counts),
+          celltype_col      = "cellType",
+          image_col         = "slide",
+          contamination     = contamination_mode,   # "none" | "percell_hc"
+          dispersion        = disp_model,
+          h_bio = h_bio, h_tech = h_tech,
+          drop_sparse_neff  = min_neff,
+          within_image      = TRUE,
+          edge_correct      = TRUE,
+          data_informed_tau = TRUE,
+          n_iter = n_iter, threads = pql_threads, tau_shrinkage = tau_shrinkage,
+          verbose = FALSE)
 }
 
+# The per-arm count matrix each PACEFit was fit on (panel A regresses the removed
+# contamination on the neighbour kernel; panel B needs the gene universe).
+ARM_Y <- list(Uncorrected = Y_raw, PACE = Y_raw,
+              Denoist = Y_denoist, `PACE+Denoist` = Y_denoist)
+
 # Reuse the saved arms if present (the four fits are expensive); else fit + save.
-# Keep only the fields the panels use: fit (panels A/B/C; neighbour kernel lives in
-# fit$re_meta$Z), df, Y, X_fixed (panel C's pace_decompose). Drops K_bio/K_tech.
-# Resolve the sweeps dir whether this chunk runs from pace_mv/ or notebooks/
-# (knitr does not carry the setup chunk's setwd into later chunks).
-arms_dir  <- "data/breast_cancer/sweeps"
-if (!dir.exists(arms_dir)) arms_dir <- "../data/breast_cancer/sweeps"
+arms_dir  <- "../../data/breast_cancer/sweeps"
 arms_path <- file.path(arms_dir, "spillover_arms_bc.rds")
-lean <- function(res) res[c("fit", "df", "Y", "X_fixed")]
 if (file.exists(arms_path)) {
   ARMS <- readRDS(arms_path)
 } else {
-  res_unc  <- fit_arm(Y_raw,     "none")
-  res_pace <- fit_arm(Y_raw,     "percell_hc")
-  res_den  <- fit_arm(Y_denoist, "none")
-  res_pd   <- fit_arm(Y_denoist, "percell_hc")
-
-  ARMS <- list(Uncorrected = lean(res_unc), PACE = lean(res_pace),
-               Denoist = lean(res_den), `PACE+Denoist` = lean(res_pd))
+  ARMS <- list(
+    Uncorrected   = fit_arm(Y_raw,     "none"),
+    PACE          = fit_arm(Y_raw,     "percell_hc"),
+    Denoist       = fit_arm(Y_denoist, "none"),
+    `PACE+Denoist` = fit_arm(Y_denoist, "percell_hc"))
   dir.create(arms_dir, recursive = TRUE, showWarnings = FALSE)
   saveRDS(ARMS, arms_path)
 }
@@ -317,17 +320,17 @@ marginal_slope <- function(E, k) {
   if (s <= 0) return(rep(NA_real_, ncol(E)))
   as.numeric(crossprod(kc, sweep(E, 2, colMeans(E), "-")) / s)
 }
-contam_slopes <- function(res, label) {
-  fit <- res$fit
-  mu_spill <- fit$mu_spill                    # dense fit returns it directly
-  if (is.null(mu_spill) && !is.null(fit$mu) && !is.null(fit$technical_offset_mat)) {
-    # streaming fit returns total mu + toff = log1p(mu_spill / mu_bio); recover
-    # the contamination contribution exactly: mu_spill = mu * (1 - exp(-toff)).
-    mu_spill <- fit$mu * (1 - exp(-fit$technical_offset_mat))
-  }
-  if (is.null(mu_spill)) return(NULL)         # arm has no contamination term
-  colnames(mu_spill) <- colnames(res$Y)
-  ctv <- as.character(res$df$celltype)
+contam_slopes <- function(arm_name) {
+  fit <- ARMS[[arm_name]]@fit                  # raw solver state from the PACEFit
+  Y   <- ARM_Y[[arm_name]]                      # the counts this arm was fit on
+  # The package (streaming) fit returns the total mean `mu` and the technical
+  # offset toff = log1p(mu_spill / mu_bio); recover the contamination contribution
+  # exactly as mu_spill = mu * (1 - exp(-toff)). Arms with contamination = "none"
+  # carry no technical offset and are skipped.
+  if (is.null(fit$mu) || is.null(fit$technical_offset_mat)) return(NULL)
+  mu_spill <- fit$mu * (1 - exp(-fit$technical_offset_mat))
+  colnames(mu_spill) <- colnames(Y)
+  ctv <- as.character(df$celltype)
   Z   <- fit$re_meta$Z                         # neighbour kernel lives here (focal::neighbour cols)
   rows <- list()
   for (fo in cell_types) for (tt in setdiff(cell_types, fo)) {
@@ -337,16 +340,16 @@ contam_slopes <- function(res, label) {
     k <- as.numeric(Z[ci, col])                # within-focal kernel for neighbour tt
     if (stats::var(k) < 1e-12) next            # dropped (n_eff) pairs are all-zero -> skipped
     rows[[paste(fo, tt)]] <- data.frame(
-      gene      = colnames(res$Y), focal = fo, neighbour = tt,
+      gene      = colnames(Y), focal = fo, neighbour = tt,
       slope     = marginal_slope(mu_spill[ci, , drop = FALSE], k),
       ratio     = ct_mean[, tt] / pmax(ct_mean[, fo], 1e-6),
-      focal_mean = ct_mean[, fo], arm = label, stringsAsFactors = FALSE)
+      focal_mean = ct_mean[, fo], arm = arm_name, stringsAsFactors = FALSE)
   }
   do.call(rbind, rows)
 }
 panelA_df <- bind_rows(
-  contam_slopes(ARMS[["PACE"]],         "PACE"),
-  contam_slopes(ARMS[["PACE+Denoist"]], "PACE+Denoist")
+  contam_slopes("PACE"),
+  contam_slopes("PACE+Denoist")
 ) |>
   filter(is.finite(ratio), is.finite(slope), focal_mean >= 0.05) |>
   mutate(arm = factor(arm, levels = c("PACE", "PACE+Denoist")))
@@ -392,7 +395,7 @@ markers <- bind_rows(lapply(ct_levels, function(ct) {
 marker_set <- split(markers$marker_ct, markers$gene)
 
 panelB_df <- bind_rows(lapply(arm_levels, function(a) {
-  s <- slopes_long(ARMS[[a]]$fit)
+  s <- slopes_long(ARMS[[a]]@fit)
   s <- s[order(-abs(s$z)), ]
   is_neighbour_marker <- mapply(function(g, nb)
     !is.null(marker_set[[g]]) && nb %in% marker_set[[g]],
@@ -468,9 +471,10 @@ down the `|z|` order while the contamination fraction
 accepted (total and the genuine, non-marker subset).
 
 ```{r significance, cache = TRUE}
-# (1) mashr lfsr per arm (neighbour slopes only). pace_shrink works on each arm's fit.
+# (1) mashr lfsr per arm (neighbour slopes only). Each arm's PACEFit already carries
+# the shrunken neighbour slopes; keep the off-diagonal (proximity) relationships.
 shr_list <- lapply(arm_levels, function(a) {
-  s <- pace_shrink(ARMS[[a]]$fit, cell_types)
+  s <- neighbourSlopes(ARMS[[a]])
   s[as.character(s$focal) != as.character(s$neighbour), , drop = FALSE]
 })
 names(shr_list) <- arm_levels
@@ -522,28 +526,12 @@ decomposition (observed CP10k denominator) computed per arm.
 
 ```{r panelC, fig.width = 12, fig.height = 6}
 TYPES <- sort(cell_types)
-normalised_pratt <- function(res, label) {
-  decomp <- pace_decompose(res$fit, res$df, res$Y, cell_types, res$X_fixed)
-  sf <- single_frame_decomp_obs(res$Y, res$df$celltype, rowSums(res$Y),
-                                decomp$gene_focal_4block)
-  foc_sp <- sf |>
-    mutate(ss_sp = `Spatial %` / 100 * denom) |>
-    group_by(focal) |>
-    summarise(spatial_pct = 100 * sum(ss_sp) / sum(denom), .groups = "drop")
-  foc_sp_v <- setNames(foc_sp$spatial_pct, as.character(foc_sp$focal))
-  mv <- list(fit = res$fit, gene_set = colnames(res$Y))
-  pace_pair_variance_pratt(mv, cond_prefix = NULL,
-                           cohort_label = "BC", block_label = "Spatial")$pair_long |>
-    filter(as.character(focal) != as.character(neighbour)) |>
-    group_by(focal) |>
-    mutate(val = foc_sp_v[as.character(focal)] * V_pair_pratt / sum(V_pair_pratt)) |>
-    ungroup() |>
-    transmute(focal = as.character(focal), neighbour = as.character(neighbour),
-              val, model = label)
-}
+# pairVariance() returns exactly the canonical single-frame normalised-Pratt table
+# (focal's total-variance spatial % split across neighbours) that analysis_bc.qmd's
+# pair heatmap draws; we tag each arm and facet.
 panelC_df <- bind_rows(
-  normalised_pratt(ARMS[["Denoist"]],      "Denoist"),
-  normalised_pratt(ARMS[["PACE+Denoist"]], "PACE+Denoist")
+  pairVariance(ARMS[["Denoist"]],      block = "spatial") |> mutate(model = "Denoist"),
+  pairVariance(ARMS[["PACE+Denoist"]], block = "spatial") |> mutate(model = "PACE+Denoist")
 )
 
 # Full focal x neighbour grid per arm (undefined/dropped pairs -> 0; diagonal blank).
