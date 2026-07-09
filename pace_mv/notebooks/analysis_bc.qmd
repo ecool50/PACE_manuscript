@@ -53,8 +53,9 @@ celltype_map <- c(
   `CD4 T`="T_Cell", `CD8 T`="T_Cell", `B Cells`="B_Cell", `Plasma`="B_Cell",
   `Macrophage`="Macrophage", `CD163+ Macrophage`="Macrophage",
   `IRF7+ DC`="Dendritic_Cell", `LAMP3+ DC`="Dendritic_Cell", `Mast cells`="Mast")
-cell_types <- c("B_Cell", "Dendritic_Cell", "Endothelial", "Macrophage",
-                "Myoepithelial", "Stromal", "T_Cell", "Tumour")
+# canonical cell-type order: indexes the random-effect blocks of the locked fit
+cell_types <- c("T_Cell", "Stromal", "Macrophage", "Tumour", "Endothelial",
+                "B_Cell", "Myoepithelial", "Dendritic_Cell")
 
 ct   <- celltype_map[as.character(colData(spe)$scClassify)]
 keep <- !is.na(ct) & ct != "Mast"
@@ -75,12 +76,15 @@ sprintf("%d cells x %d genes across %d cell types", ncol(spe), nrow(spe),
 # Fit PACE
 
 A single `paceFit()` call runs the whole pipeline. On the full section this takes
-a few minutes on eight cores.
+a few minutes on four cores. `types` fixes the cell-type block order and
+`threads = 4L` the reduction order of the threaded solve; both are needed to
+reproduce the locked fit rather than merely an equivalent one.
 
 ```{r fit, cache = TRUE}
 fit <- paceFit(spe,
                celltype_col      = "cellType",
                image_col         = "slide",
+               types             = cell_types,
                contamination     = "percell_hc",   # per-cell contamination correction
                dispersion        = "nb1",
                h_bio = 30, h_tech = 5,
@@ -88,7 +92,7 @@ fit <- paceFit(spe,
                within_image      = TRUE,
                edge_correct      = TRUE,
                data_informed_tau = TRUE,
-               n_iter = 32L, threads = 8L, tau_shrinkage = "adaptive",
+               n_iter = 32L, threads = 4L, tau_shrinkage = "adaptive",
                verbose = FALSE)
 fit
 ```

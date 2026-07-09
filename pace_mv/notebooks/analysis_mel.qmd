@@ -113,6 +113,7 @@ reference).
 fit <- paceFit(spe,
                celltype_col      = "cellType",
                image_col         = "imageID",
+               types             = cell_types,     # canonical block order
                condition_col     = "Responder",
                resp_term         = "ResponderPD",
                contamination     = "percell_hc",
