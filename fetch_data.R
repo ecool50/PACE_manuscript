@@ -10,7 +10,8 @@
 ##   * Melanoma (CosMx) -- the public SIMVI Zenodo record 14708000 (Dong et al.,
 ##     CC BY 4.0). Fetched directly; no action needed.
 ##   * Breast cancer (Xenium) -- the derived SpatialExperiment (10x public data,
-##     BIDCell segmentation). Set BC_URL / BC_MD5 below to your own deposit.
+##     nucleus segmentation, scClassify cell-type annotation). Set BC_URL / BC_MD5
+##     below to your own deposit; see ZENODO.md.
 
 ## ---- breast cancer SPE -- FILL THESE IN AFTER DEPOSITING --------------------
 BC_URL <- "REPLACE_WITH_BC_DOWNLOAD_URL"   # direct download URL for the .rds

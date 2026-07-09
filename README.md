@@ -55,7 +55,7 @@ md5-verifies each into the paths the notebooks read from:
 | Path | Contents | Source |
 |------|----------|--------|
 | `data/simvi_melanoma/14708000/Melanoma_5612.h5ad` | Melanoma CosMx cohort | Public SIMVI record [10.5281/zenodo.14708000](https://doi.org/10.5281/zenodo.14708000) (Dong et al., CC BY 4.0) — fetched automatically |
-| `data/spe_10x_nuclei_withMetrics.rds` | Breast cancer Xenium `SpatialExperiment` (10x public data, BIDCell segmentation) | Author deposit — set `BC_URL`/`BC_MD5` in `fetch_data.R` |
+| `data/spe_10x_nuclei_withMetrics.rds` | Breast cancer Xenium `SpatialExperiment` (10x public data, nucleus segmentation, scClassify cell-type annotation) | Author deposit — set `BC_URL`/`BC_MD5` in `fetch_data.R` (see `ZENODO.md`) |
 
 These two inputs are all the notebooks require; PACE fits and the
 competitor-method results are regenerated (and cached under `data/`) on first
