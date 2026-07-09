@@ -1,5 +1,17 @@
 # Zenodo deposit — breast cancer Xenium SpatialExperiment
 
+> **DEPOSITED 2026-07-09.**
+> Version DOI: [10.5281/zenodo.21271192](https://doi.org/10.5281/zenodo.21271192) — cite this one; it pins the exact file.
+> Concept DOI: [10.5281/zenodo.21271191](https://doi.org/10.5281/zenodo.21271191) — always resolves to the newest version.
+>
+> `fetch_data.R` now downloads it with no configuration. Verified end to end: the
+> record serves 144,252,835 bytes hashing to `f378bdbfafbf70e13c51467440b0d969`, and
+> the downloaded object loads as a 313 x 126,515 `SpatialExperiment` with `counts` +
+> `logcounts` and an 18-level `scClassify` column, as described below.
+>
+> Everything from section 1 down is kept as the record of what was deposited and how.
+> See section 4 for the metadata fields still worth filling in on the Zenodo side.
+
 The manuscript repository needs exactly **one** hosted file. The melanoma cohort is
 already public (SIMVI record [10.5281/zenodo.14708000](https://doi.org/10.5281/zenodo.14708000))
 and `fetch_data.R` pulls it automatically. Every other `.rds`/`.csv` under `data/` is a
@@ -126,25 +138,38 @@ section 2 wrapped in `<p>` tags.
 
 ## 4. After the DOI exists — three edits
 
-Zenodo gives you a **concept DOI** (always resolves to the newest version) and a
-**version DOI**. Cite the *version* DOI so the manuscript pins the exact file.
-
-1. **`fetch_data.R` lines 16–17** — replace both placeholders. The download URL is the
-   direct file link, of the form
-   `https://zenodo.org/records/<RECORD_ID>/files/spe_10x_nuclei_withMetrics.rds?download=1`:
+1. **`fetch_data.R`** — DONE. `BC_URL` and `BC_MD5` are filled in and the placeholder
+   `stop()` guard is gone. The URL uses the `api/records/.../content` form, matching the
+   melanoma record:
    ```r
-   BC_URL <- "https://zenodo.org/records/<RECORD_ID>/files/spe_10x_nuclei_withMetrics.rds?download=1"
+   BC_URL <- "https://zenodo.org/api/records/21271192/files/spe_10x_nuclei_withMetrics.rds/content"
    BC_MD5 <- "f378bdbfafbf70e13c51467440b0d969"
    ```
-   Then delete the `stop()` guard at lines 43–45, which exists only to prevent a silent
-   failure while the placeholders are in place.
 
-2. **`CITATION.cff`** — uncomment and fill the `doi:` under `preferred-citation` (that one
-   is the *manuscript* DOI, on acceptance/preprint — not this dataset DOI).
+2. **`CITATION.cff`** — still open, and *not* blocked by this deposit. The `doi:` under
+   `preferred-citation` is the **manuscript** DOI, filled on acceptance/preprint. It is
+   not the dataset DOI above.
 
-3. **`manuscript_current/methods.tex:126`** — replace `[repository URL]` with the two
-   GitHub URLs and `[accession numbers]` with the dataset DOI, and delete the trailing
-   `% TODO` comment. The melanoma accession is already known: `10.5281/zenodo.14708000`.
+3. **`manuscript_current/methods.tex`** — DONE. "Code and data availability" now names
+   both GitHub repositories, the dataset DOI `10.5281/zenodo.21271192`, and the melanoma
+   accession `10.5281/zenodo.14708000`.
+
+### Metadata still worth filling in on Zenodo
+
+The published record differs from the draft metadata in sections 2 and 3. None of this
+breaks reproducibility (the file and its checksum are what `fetch_data.R` depends on),
+and Zenodo lets you edit metadata without minting a new version:
+
+- **Creators** are `Willie, Elijah` and `Patrick, Ellis` only. Section 2 lists four,
+  matching `CITATION.cff`: `Rao, Shreya Rajesh` and `Ormerod, John` are absent.
+- **Related identifiers** are empty. The three from section 2 (`isSupplementTo` the
+  manuscript repo, `isCompiledBy` the package repo, `isDerivedFrom` the 10x dataset)
+  were not entered.
+- **Version** is unset; section 2 proposed `1.0.0`.
+- **Janesick 2023 DOI** is still unlooked-up, so no `references` relation was added.
+  `references.bib` has no `doi` field for `janesick2023`.
+
+Licence (CC-BY-4.0) and the file itself are as planned.
 
 ---
 

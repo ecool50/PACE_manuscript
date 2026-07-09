@@ -10,12 +10,12 @@
 ##   * Melanoma (CosMx) -- the public SIMVI Zenodo record 14708000 (Dong et al.,
 ##     CC BY 4.0). Fetched directly; no action needed.
 ##   * Breast cancer (Xenium) -- the derived SpatialExperiment (10x public data,
-##     nucleus segmentation, scClassify cell-type annotation). Set BC_URL / BC_MD5
-##     below to your own deposit; see ZENODO.md.
+##     nucleus segmentation, scClassify cell-type annotation). Zenodo record
+##     21271192 (CC BY 4.0). Fetched directly; no action needed.
 
-## ---- breast cancer SPE -- FILL THESE IN AFTER DEPOSITING --------------------
-BC_URL <- "REPLACE_WITH_BC_DOWNLOAD_URL"   # direct download URL for the .rds
-BC_MD5 <- "REPLACE_WITH_BC_MD5"            # md5sum of spe_10x_nuclei_withMetrics.rds
+## ---- breast cancer SPE -- Zenodo 10.5281/zenodo.21271192 --------------------
+BC_URL <- "https://zenodo.org/api/records/21271192/files/spe_10x_nuclei_withMetrics.rds/content"
+BC_MD5 <- "f378bdbfafbf70e13c51467440b0d969"
 
 ## ---- melanoma h5ad -- public SIMVI record (no action needed) ---------------
 MEL_URL <- "https://zenodo.org/api/records/14708000/files/Melanoma_5612.h5ad/content"
@@ -41,11 +41,7 @@ download_verified <- function(url, dest, md5, label) {
 }
 
 ## ---- fetch both inputs ------------------------------------------------------
-if (BC_URL == "REPLACE_WITH_BC_DOWNLOAD_URL")
-  stop("Set BC_URL (and BC_MD5) in fetch_data.R first -- the breast cancer SPE ",
-       "must be deposited and its download URL filled in.", call. = FALSE)
-
-download_verified(BC_URL,  BC_DEST,  BC_MD5, "breast cancer SPE")
+download_verified(BC_URL,  BC_DEST,  BC_MD5, "breast cancer SPE (Zenodo 21271192)")
 download_verified(MEL_URL, MEL_DEST, MEL_MD5, "melanoma h5ad (SIMVI Zenodo 14708000)")
 
 cat("\nData ready. Both raw inputs are in place.\n")
